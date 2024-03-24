@@ -23,7 +23,7 @@ exec(open("final_code_no3_with_reg.py").read())
 
 #exec(open("final_code_chl.py").read())
 
-exec(open("final_code_NO3_Network_baseline2.py").read())
+exec(open("final_model_code.py").read())
 #import CMIP6_second_GFDL_indian
 #exec(open("CMIP6_second_GFDL_composite_pacific_ig.py").read())
 
