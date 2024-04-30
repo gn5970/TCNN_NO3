@@ -17,15 +17,5 @@ auto_so=np.zeros((98))
 
  
 exec(open("final_code_no3_with_reg.py").read())
-
-#import CMIP6_second_GFDL_pacific
-#exec(open("final_code_npp.py").read())
-
-#exec(open("final_code_chl.py").read())
-
 exec(open("final_model_code.py").read())
-#import CMIP6_second_GFDL_indian
-#exec(open("CMIP6_second_GFDL_composite_pacific_ig.py").read())
 
-#import CMIP6_second_GFDL
-#exec(open("CMIP6_second_GFDL_composite_atlantic_ig.py").read())
