@@ -16,6 +16,7 @@ skill_so=np.zeros((9))
 auto_so=np.zeros((98))
 
  
-exec(open("final_code_no3_with_reg.py").read())
+exec(open("final_code_no3_with_reg2.py").read())
 exec(open("final_model_code.py").read())
+exec(open("final_code_TCNN_IG_SHAP.py").read())
 
