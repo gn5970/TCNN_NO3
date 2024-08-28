@@ -924,7 +924,7 @@ plt.savefig("no3_std_GFDL.png")
 temp_mean=data.tos.mean('time')
 temp_std=data.tos.std('time')
 
-infile = '/projects/CDEUTSCH/DATA/WOD23/wod_1955-2023.nc'
+infile = '/projects/CDEUTSCH/DATA/WOD23/wod_1955-2023_no3.nc'
 data=xr.open_dataset(infile)
 print('data_ATLAS',data)
 
