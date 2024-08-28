@@ -870,6 +870,77 @@ for ii in range(4):
            GB2[5,ii,N]=attributions[-84,-84,5]
 
            
+barWidth = 0.5
+vector = np.nanmean(np.nanmean(IG[:, :, :], axis=1), axis=1).reshape(6,)
+IG1 = vector.tolist()
+br1 = np.arange(len(IG1))
+br2 = [x + barWidth for x in br1]
+br3 = [x + barWidth for x in br2]
+
+
+vector = np.nanmean(np.nanmean(IG2[:, :, :], axis=1), axis=1).reshape(6,)
+IG3 = vector.tolist()
+br1 = np.arange(len(IG3))
+br2 = [x + barWidth for x in br1]
+br3 = [x + barWidth for x in br2]
+
+
+
+
+plt.figure()
+plt.bar(feature,np.abs(IG1), color ='b', width = barWidth,
+        edgecolor ='grey', label ='IG')
+#shap.summary_plot(A_mean_baseline1,feature_names=feature,plot_type="auto")
+plt.xlabel("Input Feature",fontsize=16, fontweight='bold')
+plt.ylabel("IG",fontsize=16, fontweight='bold')
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.figure()
+plt.bar(feature,np.abs(IG3), color ='b', width = barWidth,
+        edgecolor ='grey', label ='IG')
+#shap.summary_plot(A_mean_baseline1,feature_names=feature,plot_type="auto")
+plt.xlabel("Input Feature",fontsize=16, fontweight='bold')
+plt.ylabel("IG",fontsize=16, fontweight='bold')
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.show()
+
+    
+
+barWidth = 0.5
+vector = np.nanmean(np.nanmean(GB1[:, :, :], axis=1), axis=1).reshape(6,)
+GB1 = vector.tolist()
+br1 = np.arange(len(GB1))
+br2 = [x + barWidth for x in br1]
+br3 = [x + barWidth for x in br2]
+
+
+vector = np.nanmean(np.nanmean(GB2[:, :, :], axis=1), axis=1).reshape(6,)
+GB3 = vector.tolist()
+br1 = np.arange(len(GB3))
+br2 = [x + barWidth for x in br1]
+br3 = [x + barWidth for x in br2]
+
+
+
+
+plt.figure()
+plt.bar(feature,np.abs(GB1), color ='b', width = barWidth,
+        edgecolor ='grey', label ='IG')
+#shap.summary_plot(A_mean_baseline1,feature_names=feature,plot_type="auto")
+plt.xlabel("Input Feature",fontsize=16, fontweight='bold')
+plt.ylabel("IG",fontsize=16, fontweight='bold')
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.figure()
+plt.bar(feature,np.abs(GB3), color ='b', width = barWidth,
+        edgecolor ='grey', label ='IG')
+#shap.summary_plot(A_mean_baseline1,feature_names=feature,plot_type="auto")
+plt.xlabel("Input Feature",fontsize=16, fontweight='bold')
+plt.ylabel("IG",fontsize=16, fontweight='bold')
+plt.xticks(fontsize=16)
+plt.yticks(fontsize=16)
+plt.show()
  
     
 
