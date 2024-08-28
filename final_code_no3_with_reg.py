@@ -25,8 +25,11 @@ from sklearn.model_selection import train_test_split
 from scipy import stats
 import cartopy.feature as cfeature
 #from geocat.viz import cmaps as gvcmaps
-
-
+from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import Ridge
+from scipy.stats import ttest_rel
+from scipy.stats import norm
 
 def split_sequences(input_sequences, output_sequence, n_steps_in, n_steps_out):
     X, y = list(), list() # instantiate X and y
@@ -189,6 +192,41 @@ def earth_radius(lat):
 
     return r
 
+def calc_w_from_convergence(u_var, v_var, wrapx = True, wrapy = False):
+
+  tmax = u_var.shape[0]
+
+  ntime, nk, nlat, nlon = u_var.shape
+  w = np.ma.zeros( (ntime, nk+1, nlat, nlon)  )
+  # Work timelevel by timelevel
+  for tidx in range(0,tmax):
+    # Get and process the u component
+    u_dat = u_var[tidx,:,:,:]
+    #h_mask = np.logical_or(np.ma.getmask(u_dat), np.ma.getmask(np.roll(u_dat,1,axis=-1)))
+    #u_dat = u_dat.filled(0.)
+
+    # Get and process the v component
+    v_dat = v_var[tidx,:,:,:]
+    #h_mask = np.logical_or(h_mask,np.ma.getmask(v_dat))
+    #h_mask = np.logical_or(h_mask,np.ma.getmask(np.roll(v_dat,1,axis=-2)))
+    #v_dat = v_dat.filled(0.)
+
+    # Order of subtraction based on upwind sign convention and desire for w>0 to correspond with upwards velocity
+    w[tidx,:-1,:,:] += np.roll(u_dat,1,axis=-1)-u_dat
+    if not wrapx: # If not wrapping, then convergence on westernmost side is simply so subtract back the rolled value
+      w[tidx,:-1,:,0] += -u_dat[:-1,:,-1]
+    w[tidx,:-1,:,:] += np.roll(v_dat,1,axis=-2)-v_dat
+    if not wrapy: # If not wrapping, convergence on westernmost side is v
+      w[tidx,:-1,0,:] += -v_dat[:,-1,:]
+    w[tidx,-1,:,:] = 0.
+    # Do a double-flip so that we integrate from the bottom
+    w[tidx,:-1,:,:] = w[tidx,-2::-1,:,:].cumsum(axis=0)[::-1,:,:]
+    # Mask if any of u[i-1], u[i], v[j-1], v[j] are not masked
+    #w[tidx,:-1,:,:] = np.ma.masked_where(h_mask, w[tidx,:-1,:,:])
+    # Bottom should always be zero, mask applied wherever the top interface is a valid value
+    #w[tidx,-1,:,:] = np.ma.masked_where(h_mask[-2,:,:], w[tidx,-1,:,:])
+
+  return w
 
 def wgt_areaave(indat, latS, latN, lonW, lonE):
   lat=indat.lat
@@ -199,13 +237,13 @@ def wgt_areaave(indat, latS, latN, lonW, lonE):
      lon=( (lon + 180) % 360 - 180)
   else:
      anm=indat
-
+  valid_mask = ~np.isnan(anm)
   iplat = lat.where( (lat >= latS ) & (lat <= latN), drop=True)
   iplon = lon.where( (lon >= lonW ) & (lon <= lonE), drop=True)
 
 #  print(iplon)
   wgt = np.cos(np.deg2rad(lat))
-  odat=anm.sel(lat=iplat,lon=iplon).weighted(wgt).mean(("lon", "lat"), skipna=True)
+  odat=anm.where(valid_mask).sel(lat=iplat,lon=iplon).weighted(wgt).mean(("lon", "lat"), skipna=True)
   return(odat)
 
 def detrend_dim(da, dim, deg=1):
@@ -789,19 +827,116 @@ class EofSolver(object):
         return projected_pcs
 
 
-infile = '/projects/CDEUTSCH/DATA/WOD18/wod18_1955-2019.nc'
+infile = '/scratch/gpfs/gn5970/data/GFDL-ESM4_tos_no3.nc'
 data=xr.open_dataset(infile)
 #data = data.dropna(dim='time', how='any')
 
 print("data",data)
-data['time']=pd.date_range("1955-01-01", periods=780, freq="M")
+data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
 
+min_lon = 0
+min_lat = -90
+min_depth = 0
+
+max_lon = 360
+max_lat = -50
+max_depth = 50
+
+mask_lon = (data.lon >= min_lon) & (data.lon <= max_lon)
+mask_lat = (data.lat >= min_lat) & (data.lat <= max_lat)
+#mask_depth = (data.depth >= min_depth) & (data.depth <= max_depth)
+data = data.where(mask_lat, drop=True)
+#data=data.mean('depth')
+
+lon=np.array(data.lon)
+lat=np.array(data.lat)
+
+no3_mean=data.no3.mean('time')*(1000)
+no3_mean=np.array(no3_mean)
+no3_std=data.no3.std('time')*(1000)
+no3_std=np.array(no3_std)
+
+for i in range(1):
+    plt.figure(figsize=(10, 10),dpi=1200)
+    plt.subplot(211)
+
+    # Create a polar stereographic projection
+    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
+
+    ax.coastlines(resolution='110m')
+    ax.gridlines()
+
+    # Define the yticks for latitude
+    #lat_formatter = cticker.LatitudeFormatter()
+    #ax.yaxis.set_major_formatter(lat_formatter)
+
+    v = np.linspace(0, 32, 40, endpoint=True)
+
+    # Contour plot with PlateCarree projection
+    fill = ax.contourf(lon, lat, no3_mean.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+
+    # Make the aspect ratio equal to get a circular plot
+    ax.set_aspect('equal')
+
+    # Colorbar
+    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
+    font_size = 20  # Adjust as appropriate.
+    cb.ax.tick_params(labelsize=font_size)
+    ax.contour(lon,lat, no3_mean.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+    # Set the latitude limits
+    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
+plt.savefig("no3_mean_GFDL.png")
+
+
+
+for i in range(1):
+    plt.figure(figsize=(10, 10),dpi=1200)
+    plt.subplot(211)
+
+    # Create a polar stereographic projection
+    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
+
+    ax.coastlines(resolution='110m')
+    ax.gridlines()
+
+    # Define the yticks for latitude
+    #lat_formatter = cticker.LatitudeFormatter()
+    #ax.yaxis.set_major_formatter(lat_formatter)
+
+    v = np.linspace(0, 3.5, 40, endpoint=True)
+
+    # Contour plot with PlateCarree projection
+    fill = ax.contourf(lon, lat, no3_std.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+
+    # Make the aspect ratio equal to get a circular plot
+    ax.set_aspect('equal')
+
+    # Colorbar
+    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
+    font_size = 20  # Adjust as appropriate.
+    cb.ax.tick_params(labelsize=font_size)
+    ax.contour(lon,lat, no3_mean.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+    # Set the latitude limits
+    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
+plt.savefig("no3_std_GFDL.png")
+
+
+temp_mean=data.tos.mean('time')
+temp_std=data.tos.std('time')
+
+infile = '/projects/CDEUTSCH/DATA/WOD23/wod_1955-2023.nc'
+data=xr.open_dataset(infile)
+print('data_ATLAS',data)
+
+data['time']=pd.date_range("1955-01-01", periods=828, freq="M")
+dtaa=data.isel(time=slice(100,828))
+#data=data.mean('nbounds')
 min_lon = -180
 min_lat = -90
 min_depth = 0
 
 max_lon = 180
-max_lat = -30
+max_lat = -50
 max_depth = 50
 
 mask_lon = (data.lon >= min_lon) & (data.lon <= max_lon)
@@ -813,8 +948,16 @@ data=data.mean('depth')
 lon=np.array(data.lon)
 lat=np.array(data.lat)
 
-no3_mean=data.no3.mean('time')
-no3_std=data.no3.std('time')
+no3_mean_atlas=data.no3.mean('time')
+no3_mean_dd=data.no3_dd.mean('time')
+print('no3_mean_atlas',no3_mean_atlas)
+no3_mean_atlas=np.array(no3_mean_atlas)
+
+no3_std_atlas=data.no3.std('time')
+print('no3_mean_atlas',no3_std_atlas)
+no3_std_atlas=np.array(no3_std_atlas)
+
+no3_mean_dd=np.array(no3_mean_dd)
 for i in range(1):
     plt.figure(figsize=(10, 10),dpi=1200)
     plt.subplot(211)
@@ -827,12 +970,12 @@ for i in range(1):
 
     # Define the yticks for latitude
     lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
+    #ax.yaxis.set_major_formatter(lat_formatter)
 
     v = np.linspace(0, 32, 40, endpoint=True)
 
     # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, no3_mean.squeeze(), v, cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
+    fill = ax.contourf(lon, lat, no3_mean_atlas.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
 
     # Make the aspect ratio equal to get a circular plot
     ax.set_aspect('equal')
@@ -841,7 +984,7 @@ for i in range(1):
     cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
     font_size = 20  # Adjust as appropriate.
     cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, no3_mean.squeeze(),color='k',cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
+    ax.contour(lon,lat, no3_mean_atlas.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
     # Set the latitude limits
     ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
 plt.savefig("no3_WODB.png")
@@ -858,12 +1001,12 @@ for i in range(1):
 
     # Define the yticks for latitude
     lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
+    #ax.yaxis.set_major_formatter(lat_formatter)
 
-    v = np.linspace(0, 3.6, 40, endpoint=True)
+    v = np.linspace(0, 3, 40, endpoint=True)
 
     # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, no3_std.squeeze(), v, cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
+    fill = ax.contourf(lon, lat, no3_std_atlas.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
 
     # Make the aspect ratio equal to get a circular plot
     ax.set_aspect('equal')
@@ -872,26 +1015,18 @@ for i in range(1):
     cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
     font_size = 20  # Adjust as appropriate.
     cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, no3_mean.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+    ax.contour(lon,lat, no3_std_atlas.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
     # Set the latitude limits
     ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("no3_WODB_std.png")
+plt.savefig("no3_std_WODB.png")
 
 
 
 
-infile = '/scratch/gpfs/gn5970/data/GFDL-ESM4_tos_no3.nc'
-#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
-data=xr.open_dataset(infile)
-import datetime
-data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
+mask = np.abs(no3_mean-no3_mean_atlas) < 6
 
-lon=np.array(data.lon)
-lat=np.array(data.lat)
-print('data_GFDL',data)
-
-
-no3_mean_GFDL=np.array(data.no3.mean('time')*1000)
+# Select the points where the difference is less than 1
+filtered_difference = np.where(mask, no3_mean-no3_mean_atlas, np.nan)
 
 for i in range(1):
     plt.figure(figsize=(10, 10),dpi=1200)
@@ -902,107 +1037,14 @@ for i in range(1):
 
     ax.coastlines(resolution='110m')
     ax.gridlines()
-
     # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-
-    v = np.linspace(0, 32, 40, endpoint=True)
-
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, no3_mean_GFDL.squeeze(), v, cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
-
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
-
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, no3_mean_GFDL.squeeze(),color='k',cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    ax.set_extent([0, 360, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("no3_GFDL.png")
-
-no3_std_GFDL=np.array(data.no3.std('time')*1000)
-
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
-
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-
-    v = np.linspace(0, 3.6, 40, endpoint=True)
-
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, no3_std_GFDL.squeeze(), v, cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
-
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
-
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, no3_std_GFDL.squeeze(),color='k',cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    ax.set_extent([0, 360, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("no3_std_GFDL.png")
-
-#calculate hte bias
-valid_indices = ~np.isnan(no3_mean)
-
-# Compute the difference only where values are not NaN
-difference = np.zeros_like(no3_mean)  # Initialize an array to store the differences
-
-ii, jj = np.nonzero(no3_mean)
-print('ii',ii)
-print('jj',jj)
-selected_values_GFDL = no3_mean_GFDL[ii, jj]
-
-A1=[]
-for i in range(21558):
-    A1.append(selected_values_GFDL[i])
-A1=np.array(A1)
-
-
-#difference = A2 - A1 
-#not_nan_mask = ~np.isnan(no3_mean)
-
-# Calculate the difference where A is not NaN
-difference= no3_mean - no3_mean_GFDL
-
-
-#lat=np.array(data.lat.data)
-#lon=np.array(data.lon.data)
-
-
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
-
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
+    #lat_formatter = cticker.LatitudeFormatter()
+    #ax.yaxis.set_major_formatter(lat_formatter)
 
     v = np.linspace(-6, 6, 40, endpoint=True)
 
     # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon+180, lat, difference.squeeze(),v, cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
+    fill = ax.contourf(lon, lat, (no3_mean-no3_mean_atlas).squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
 
     # Make the aspect ratio equal to get a circular plot
     ax.set_aspect('equal')
@@ -1011,10 +1053,13 @@ for i in range(1):
     cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
     font_size = 20  # Adjust as appropriate.
     cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, difference,color='k',cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
+    #emphasize = ax.contour(lon, lat, np.abs(no3_mean-no3_mean_atlas)  < 1, levels=[0.5], colors='black', linewidths=1.5, transform=ccrs.PlateCarree())
+
+    ax.contour(lon,lat, (no3_mean-no3_mean_atlas).squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
     # Set the latitude limits
-    ax.set_extent([0, 360, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("no3_bias_GFDL.png")
+    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
+plt.savefig("no3_bias.png")
+
 
 for i in range(1):
     plt.figure(figsize=(10, 10),dpi=1200)
@@ -1025,15 +1070,14 @@ for i in range(1):
 
     ax.coastlines(resolution='110m')
     ax.gridlines()
-
     # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
+    #lat_formatter = cticker.LatitudeFormatter()
+    #ax.yaxis.set_major_formatter(lat_formatter)
 
-    v = np.linspace(-3, 3, 40, endpoint=True)
+    v = np.linspace(0, 1, 40, endpoint=True)
 
     # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon+180, lat, (no3_std-no3_std_GFDL).squeeze(),v, cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
+    fill = ax.contourf(lon, lat, filtered_difference.squeeze(), cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
 
     # Make the aspect ratio equal to get a circular plot
     ax.set_aspect('equal')
@@ -1042,139 +1086,163 @@ for i in range(1):
     cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
     font_size = 20  # Adjust as appropriate.
     cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, no3_mean_GFDL.squeeze(),color='k',cmap=plt.cm.viridis, transform=ccrs.PlateCarree())
+    #emphasize = ax.contour(lon, lat, np.abs(no3_mean-no3_mean_atlas)  < 1, levels=[0.5], colors='black', linewidths=1.5, transform=ccrs.PlateCarree())
+
+    #ax.contour(lon,lat, no3_mean.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
     # Set the latitude limits
-    ax.set_extent([0, 360, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("no3_std_bias_GFDL.png")
+    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
+plt.savefig("no3_bias_onlyvalid.png")
 
 
 
+mask = np.abs(no3_std-no3_std_atlas) < 1
 
-lat=data.lat
-lon=data.lon
-time=data.time
+# Select the points where the difference is less than 1
+filtered_difference = np.where(mask, no3_std-no3_std_atlas, np.nan)
+
+for i in range(1):
+    plt.figure(figsize=(10, 10),dpi=1200)
+    plt.subplot(211)
+
+    # Create a polar stereographic projection
+    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
+
+    ax.coastlines(resolution='110m')
+    ax.gridlines()
+    # Define the yticks for latitude
+    #lat_formatter = cticker.LatitudeFormatter()
+    #ax.yaxis.set_major_formatter(lat_formatter)
+
+    v = np.linspace(0, 0.7, 40, endpoint=True)
+
+    # Contour plot with PlateCarree projection
+    fill = ax.contourf(lon, lat, filtered_difference.squeeze(), cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+
+    # Make the aspect ratio equal to get a circular plot
+    ax.set_aspect('equal')
+
+    # Colorbar
+    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
+    font_size = 20  # Adjust as appropriate.
+    cb.ax.tick_params(labelsize=font_size)
+    #emphasize = ax.contour(lon, lat, np.abs(no3_mean-no3_mean_atlas)  < 1, levels=[0.5], colors='black', linewidths=1.5, transform=ccrs.PlateCarree())
+
+    #ax.contour(lon,lat, no3_mean.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+    # Set the latitude limits
+    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
+plt.savefig("no3_bias_std_onlyvalid.png")
+
+
+# Print the results
+#print(f"T-statistic: {t_stat}")
+#print(f"P-value: {p_value}")
+
+# Interpret the p-value
+#alpha = 0.05  # Significance level
+#if p_value < alpha:
+#    print("The residuals are statistically significant (reject H0).")
+#else:
+#    print("The residuals are not statistically significant (fail to reject H0).")
+
+
+
+#infile = '/scratch/gpfs/gn5970/data/GFDL-ESM4_tos_no3.nc'
+infile = '/projects/CDEUTSCH/DATA/WOD23/wod_1955-2023_anom.nc'
+#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
+data=xr.open_dataset(infile)
+data['time']=pd.date_range("1955-01-01", periods=828, freq="M")
+min_lon = -180
+min_lat = -90
+min_depth = 0
+
+max_lon = 180
+max_lat = -50
+max_depth = 50
+
+mask_lon = (data.lon >= min_lon) & (data.lon <= max_lon)
+mask_lat = (data.lat >= min_lat) & (data.lat <= max_lat)
+mask_depth = (data.depth >= min_depth) & (data.depth <= max_depth)
+data = data.where(mask_lat & mask_depth, drop=True)
+data=data.mean('depth')
+#data_no3=np.array(detrend_dim(data.no3,dim='time'))
+lon=np.array(data.lon)
+lat=np.array(data.lat)
+print('data_GFDL',data)
+
+#lon=np.array(selected_values.lon.data)
+
+#print('lat',lat)
+#print('lon',lon)
 
 
 from scipy.signal import detrend
-#lat=np.array(data.lat)
-#lon=np.array(data.lon)
-time=np.array(data.time)
-
-infile = '/scratch/gpfs/gn5970/data/area-GFDL-ESM4.nc'
-#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
-area=xr.open_dataset(infile)
-area=area.areacello
-min_lat = -90
-
-max_lon = 360
-max_lat =  -30
-min_z=0
-max_z=50
-mask_lat = (area.lat >= min_lat) & (area.lat <= max_lat)
-
-area = area.where(mask_lat, drop=True)
 
 
 
-total_area = area.sum(['lat','lon'])
+
+#lat=np.array(data.lat.data)
+#lon=np.array(data.lon.data)
 # temperature weighted by grid-cell area
-sst_weighted =data.tos
-
-sst_detrend=detrend_dim(sst_weighted,dim='time')
-#sst_detrend=xr.apply_ufunc(detrend, sst_weighted.fillna(0),
-#                                    kwargs={'axis': 0}).where(~sst_weighted.isnull())
-wgt = np.cos(np.deg2rad(sst_detrend['lat']))
-
-sst_clim = sst_detrend.groupby('time.month').mean(dim='time',skipna=True)
-sst_anom = sst_detrend.groupby('time.month') - sst_clim
+no3=data.no3
+#no3_clim = no3.groupby('time.month').mean(dim='time',skipna=True)
+#no3_anom = no3.groupby('time.month') - no3_clim
 #sst_anom=sst_anom.coarsen(time=3).mean()
-sst_anom2=sst_anom/sst_anom.std()
-A_tos=np.array(sst_anom2)
-sst_anom=wgt_areaave(sst_anom,-90,-30,0,360)
-tos_index=sst_anom/sst_anom.std()
-tos_index=np.array(tos_index)
-print("A",A_tos.shape)
+#no3_weighted =data.no3#(data.tos*area) / total_area
+import numpy as np
+import xarray as xr
+import matplotlib.pyplot as plt
+
+#def detrend(data, axis=-1):
+#    """Remove linear trend along axis"""
+#    p = np.polyfit(np.arange(data.shape[axis]), data, 1, axis=axis)
+#    return data - np.polyval(p, np.arange(data.shape[axis])[..., None], axis=axis)
+
+def wgt_areaave(indat, latS, latN, lonW, lonE):
+    lat = indat.lat
+    lon = indat.lon
+
+    # Handle longitude wrapping
+    if ((lonW < 0) or (lonE < 0)) and (lon.values.min() > -1):
+        anm = indat.assign_coords(lon=((lon + 180) % 360 - 180))
+        lon = (lon + 180) % 360 - 180
+    else:
+        anm = indat
+
+    iplat = lat.where((lat >= latS) & (lat <= latN), drop=True)
+    iplon = lon.where((lon >= lonW) & (lon <= lonE), drop=True)
+
+    # Mask NaN values
+    valid_mask = ~np.isnan(anm)
+
+    # Calculate weights using the cosine of latitude
+    wgt = np.cos(np.deg2rad(lat))
+
+    # Apply the weights and calculate the mean, excluding NaN values
+    odat = anm.where(valid_mask).sel(lat=iplat, lon=iplon).weighted(wgt).mean(("lon", "lat"), skipna=True)
+   
+
+    return odat
 
 
-lat=np.array(data.lat)
-lon=np.array(data.lon)
-coslat = np.cos(np.deg2rad(lat))
-wgts = np.sqrt(coslat)[..., np.newaxis]
-solver = EofSolver(A_tos[:,:,:], weights=wgts)
-eof1_tos = solver.eofs(neofs=20, eofscaling=2)
-pc1_tos= solver.pcs(npcs=20, pcscaling=1)
-variance=solver.varianceFraction()
+anomaly_no3 = wgt_areaave(no3, -90, -50, -180, 180)
+anomaly_no3 = anomaly_no3 / anomaly_no3.std()
+no3_glb_avg=np.array(anomaly_no3)
+# Calculate z-scores and exclude outliers
+mean = np.nanmean(no3_glb_avg)
+standard_deviation = np.nanstd(no3_glb_avg)
+distance_from_mean = abs(no3_glb_avg - mean)
+max_deviations = 2
+not_outlier = distance_from_mean < max_deviations * standard_deviation
+outlier=distance_from_mean > max_deviations * standard_deviation
+no3_glb_avg=no3_glb_avg[not_outlier]
+no3_glb_avg=detrend_dim(xr.DataArray(no3_glb_avg),dim='dim_0')
 
 
-
-fig, axarr = plt.subplots(nrows=2, figsize=[10, 10])
-
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
-    
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-    
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-    
-    plt.title("EOF1 Buoyancy")
-    
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-    
-    v = np.linspace(-0.7, 0.7, 40, endpoint=True)
-    
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, (eof1_tos[0,:,:]*np.nanstd(pc1_tos[:,0],axis=0)).squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
-    
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, (eof1_tos[0,:,:]*np.nanstd(pc1_tos[:,0],axis=0)).squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("eof1_tos_final.pdf")
-
-
-
-year=np.arange(1850,2015,1/12)
-plt.figure(figsize=(10, 10),dpi=1200)
-plt.plot(year,pc1_tos[:,0]/np.nanstd(pc1_tos[:,0],axis=0))
-plt.xticks(fontsize=20)
-plt.yticks(fontsize=20)
-plt.xticks(rotation=45)
-plt.savefig("pc1_tos_final.png")
-
-### correlation ma
-print("area",area.shape)
-
-
-no3_weighted =data.no3
-
-no3_detrend=detrend_dim(no3_weighted,dim='time')
-#sst_detrend=xr.apply_ufunc(detrend, sst_weighted.fillna(0),
-#                                    kwargs={'axis': 0}).where(~sst_weighted.isnull())
-wgt = np.cos(np.deg2rad(no3_detrend['lat']))
-
-no3_clim = no3_detrend.groupby('time.month').mean(dim='time',skipna=True)
-no3_anom = no3_detrend.groupby('time.month') - no3_clim
-#sst_anom=sst_anom.coarsen(time=3).mean()
-no3_anom2=no3_anom/no3_anom.std()
-A_no3=np.array(no3_anom2)
-no3_anom=wgt_areaave(no3_anom,-90,-30,0,360)
-no3_index=no3_anom/no3_anom.std()
 #no3_index=np.array(no3_index)
-
+print('no3_glb_avg',no3_glb_avg)
 
 plt.figure()
-no3_index.plot()
+no3_glb_avg.coarsen(dim_0=3).mean().plot()
 ax = plt.gca()
 ax.set_title('')  # Set an empty string as the title
 #plt.xticks(range(1850,2014,10), rotation='vertical')
@@ -1184,9 +1252,192 @@ plt.ylabel('NO3 anomalies',fontsize=20)
 plt.xticks(fontsize=20)
 plt.yticks(fontsize=20)
 plt.tight_layout()
-plt.savefig("nitrogen_anomaly_GFDL.pdf")
+plt.savefig("nitrogen_anomaly_GFDL2.pdf")
 
-no3_index=np.array(no3_index)
+no3_index=np.array(no3_glb_avg)
+#print('non_nan_values_list',non_nan_values_list.shape)
+
+anomaly_tos = wgt_areaave(data.temp, -90, -50, -180, 180)
+anomaly_tos = anomaly_tos / anomaly_tos.std()
+tos_glb_avg=np.array(anomaly_tos)
+# Calculate z-scores and exclude outliers
+mean = np.nanmean(tos_glb_avg)
+standard_deviation = np.nanstd(tos_glb_avg)
+distance_from_mean = abs(tos_glb_avg - mean)
+max_deviations = 2
+not_outlier = distance_from_mean < max_deviations * standard_deviation
+outlier=distance_from_mean > max_deviations * standard_deviation
+tos_glb_avg=tos_glb_avg[not_outlier]
+tos_glb_avg=detrend_dim(xr.DataArray(tos_glb_avg),dim='dim_0')
+
+
+#print("A",A_tos.shape)
+
+year=np.arange(1850,2015,1/12)
+plt.figure()
+tos_glb_avg.isel(dim_0=slice(0,690)).coarsen(dim_0=3).mean().plot()
+plt.xlabel('Year',fontsize=20)
+#plt.ylabel('NPP anomalies',fontsize=20)
+plt.xticks(fontsize=20)
+plt.yticks(fontsize=20)
+plt.tight_layout()
+plt.savefig('tos_index.pdf')
+
+anomaly_salt = wgt_areaave(data.salt, -90, -50, -180, 180)
+anomaly_salt = anomaly_salt / anomaly_salt.std()
+salt_glb_avg=np.array(anomaly_salt)
+# Calculate z-scores and exclude outliers
+mean = np.nanmean(salt_glb_avg)
+standard_deviation = np.nanstd(salt_glb_avg)
+distance_from_mean = abs(salt_glb_avg - mean)
+max_deviations = 2
+not_outlier = distance_from_mean < max_deviations * standard_deviation
+outlier=distance_from_mean > max_deviations * standard_deviation
+salt_glb_avg=salt_glb_avg[not_outlier]
+salt_glb_avg=detrend_dim(xr.DataArray(salt_glb_avg),dim='dim_0')
+
+
+#print("A",A_tos.shape)
+
+year=np.arange(1850,2015,1/12)
+plt.figure()
+salt_glb_avg.isel(dim_0=slice(0,678)).coarsen(dim_0=3).mean().plot()
+plt.xlabel('Year',fontsize=20)
+#plt.ylabel('NPP anomalies',fontsize=20)
+plt.xticks(fontsize=20)
+plt.yticks(fontsize=20)
+plt.tight_layout()
+plt.savefig('salt_index.pdf')
+
+
+
+def lagged_correlation(series1, series2, max_lag):
+    """
+    Calculate the lagged correlation between two time series.
+
+    Args:
+    - series1: The first time series (numpy array or pandas Series).
+    - series2: The second time series (numpy array or pandas Series).
+    - max_lag: The maximum lag to consider (integer).
+
+    Returns:
+    - lags: An array of lag values.
+    - correlations: An array of correlation coefficients corresponding to each lag.
+    - p_values: An array of p-values corresponding to each correlation coefficient.
+    """
+    lags = np.arange(-max_lag, max_lag + 1)
+    correlations = []
+    p_values = []
+
+    for lag in lags:
+        if lag < 0:
+            corr = np.corrcoef(series1[:lag], series2[-lag:])[0, 1]
+            n = len(series1[:lag])
+        elif lag > 0:
+            corr = np.corrcoef(series1[lag:], series2[:-lag])[0, 1]
+            n = len(series1[lag:])
+        else:
+            corr = np.corrcoef(series1, series2)[0, 1]
+            n = len(series1)
+        correlations.append(corr)
+
+        # Fisher Z-transformation
+        fisher_z = np.arctanh(corr)
+        standard_error = 1 / np.sqrt(n - 3)
+        z = fisher_z / standard_error
+        p_value = 2*(1 - norm.cdf(abs(z)))  # Two-tailed test
+        p_values.append(p_value)
+
+    return lags, correlations, p_values
+
+
+
+# older code
+infile = '/scratch/gpfs/gn5970/data/GFDL-ESM4_tos_no3.nc'
+#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
+data=xr.open_dataset(infile)
+import datetime
+data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
+min_lon = 0
+min_lat = -90
+min_depth = 0
+
+max_lon = 360
+max_lat = -50
+max_depth = 50
+
+mask_lon = (data.lon >= min_lon) & (data.lon <= max_lon)
+mask_lat = (data.lat >= min_lat) & (data.lat <= max_lat)
+#mask_depth = (data.depth >= min_depth) & (data.depth <= max_depth)
+data = data.where(mask_lat , drop=True)
+lon=np.array(data.lon)
+lat=np.array(data.lat)
+
+tos_weighted =data.tos#(data.so*area) / total_area
+
+tos_detrend=detrend_dim(tos_weighted,dim='time')
+
+tos_clim = tos_detrend.groupby('time.month').mean(dim='time',skipna=True)
+tos_anom = tos_detrend.groupby('time.month') - tos_clim
+#so_anom=so_anom.coarsen(time=3).mean()
+#tos_anom=tos_anom.coarsen(time=2).mean()
+tos_anom2=tos_anom/tos_anom.std()
+A_tos2=np.array(tos_anom2)
+
+tos_anom=wgt_areaave(tos_anom,-90,-50,0,360)
+tos_index=tos_anom/tos_anom.std()
+tos_index=np.array(tos_index)
+
+no3_weighted =data.no3#(data.so*area) / total_area
+
+no3_detrend=detrend_dim(no3_weighted,dim='time')
+
+no3_clim = no3_detrend.groupby('time.month').mean(dim='time',skipna=True)
+no3_anom = no3_detrend.groupby('time.month') - no3_clim
+
+#no3_anom=no3_anom.coarsen(time=2).mean()
+#so_anom=so_anom.coarsen(time=3).mean()
+no3_anom2=no3_anom/no3_anom.std()
+A_no3=np.array(no3_anom2)
+
+no3_anom=wgt_areaave(no3_anom,-90,-50,0,360)
+no3_index=no3_anom/no3_anom.std()
+
+
+year=np.arange(1850,2015,1/12)
+plt.figure()
+no3_index.plot()
+plt.xlabel('Year',fontsize=20)
+#plt.ylabel('NPP anomalies',fontsize=20)
+plt.xticks(fontsize=20)
+plt.yticks(fontsize=20)
+plt.tight_layout()
+plt.savefig('no3_index2.pdf')
+
+
+correlation_no3_tos=[]
+correlation_no3_no3=[]
+for i in range(40):
+    for j in range(360):
+        data_subset_no3 = no3_anom2.isel(lat=i,lon=j, drop=True)
+        data_subset_tos = tos_anom2.isel(lat=i,lon=j, drop=True)
+
+        correlation_no3_tos.append(xr.corr(no3_index,data_subset_tos))
+        correlation_no3_no3.append(xr.corr(no3_index,data_subset_no3))
+
+correlation_no3_tos=np.array(correlation_no3_tos)
+correlation_no3_tos=correlation_no3_tos.reshape(40,360)
+
+correlation_no3_no3=np.array(correlation_no3_no3)
+correlation_no3_no3=correlation_no3_no3.reshape(40,360)
+
+
+print('correlation',correlation_no3_tos.shape)
+
+#no3_index=np.array(no3_index)
+
+
+
 
 for i in range(1):
     plt.figure(figsize=(10, 10),dpi=1200)
@@ -1198,17 +1449,17 @@ for i in range(1):
     ax.coastlines(resolution='110m')
     ax.gridlines()
 
-    T_corr=correlation_map(no3_index,A_tos[:,:,:])
-    T_reg=np.divide(covariance_map(no3_index, A_tos[:,:,:]),np.var(no3_index))
+    #T_corr=correlation_map(no3_index,A_tos2[:,:,:])
+    #T_reg=np.divide(covariance_map(no3_index, A_tos2[:,:,:]),np.var(no3_index))
 
     # Define the yticks for latitude
     lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
+    #ax.yaxis.set_major_formatter(lat_formatter)
 
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
+    v = np.linspace(-0.6, 0.6, 40, endpoint=True)
 
     # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, T_corr.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+    fill = ax.contourf(lon, lat, correlation_no3_tos.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
 
     # Make the aspect ratio equal to get a circular plot
     ax.set_aspect('equal')
@@ -1217,10 +1468,10 @@ for i in range(1):
     cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
     font_size = 20  # Adjust as appropriate.
     cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+    #ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
     # Set the latitude limits
     df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
+    sig=xr.DataArray(data=correlation_no3_tos*np.sqrt((df-2)/(1-np.square(correlation_no3_tos))),
       dims=["lat","lon'"],
       coords=[lat, lon])
     t90=stats.t.ppf(1-0.05, df-2)
@@ -1228,64 +1479,102 @@ for i in range(1):
     sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
       hatches=['..', None, None, None, '..'], extend='both',
       add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
+    ax.set_extent([-180, 180, -90, -50], crs=ccrs.PlateCarree())
 plt.savefig("correlation_tos_no3.pdf")
 
+max_lag = 60  # Define the maximum lag you want to consider
+lags, correlations, p_values = lagged_correlation(no3_index, tos_index, max_lag)
 
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
+# Convert to pandas DataFrame for better visualization
+correlation_df = pd.DataFrame({'Lag': lags, 'Correlation': correlations, 'p-value': p_values})
 
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
+# Plot the lagged correlation
+import matplotlib.pyplot as plt
 
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
+plt.figure(figsize=(10, 6))
+plt.plot(correlation_df['Lag'], correlation_df['Correlation'], marker='o', label='Correlation')
+plt.axhline(0, color='grey', linestyle='--')
+plt.axhline(y=0.196, color='red', linestyle='--', label='Significance Level (p < 0.05)')
+plt.axhline(y=-0.196, color='red', linestyle='--')
+plt.grid(True)
 
-    T_corr=correlation_map(no3_index[-980:],A_tos[-980:,:,:])
-    T_reg=np.divide(covariance_map(no3_index[-980:], A_tos[-980:,:,:]),np.var(no3_index[-980:]))
+# Highlight significant correlations
+significance_level = 0.05
+significant = correlation_df['p-value'] < significance_level
+plt.scatter(correlation_df['Lag'][significant], correlation_df['Correlation'][significant], color='red', label='Significant (p < 0.05)')
+plt.xlabel("Lag",fontsize=18, fontweight='bold')
+plt.ylabel("Correlation",fontsize=18, fontweight='bold')
+plt.xticks(fontsize=18)
+plt.yticks(fontsize=18)
+plt.legend()
+plt.show()
+plt.savefig('no3_tos_lag.pdf')
 
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
+# Create a figure and axis with polar stereographic projection
+fig, ax = plt.subplots(1, 1, figsize=(10, 10), dpi=1200, subplot_kw={'projection': ccrs.SouthPolarStereo()})
 
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
+# Add coastlines and gridlines
+ax.coastlines(resolution='110m')
+ax.gridlines()
 
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, T_corr.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+# Define contour levels
+v = np.linspace(-0.8, 0.8, 40, endpoint=True)
 
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
+# Contour plot with PlateCarree projection
+fill = ax.contourf(lon, lat, correlation_no3_no3.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
 
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
-      dims=["lat","lon'"],
-      coords=[lat, lon])
-    t90=stats.t.ppf(1-0.05, df-2)
-    t95=stats.t.ppf(1-0.025, df-2)
-    sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
-      hatches=['..', None, None, None, '..'], extend='both',
-      add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("correlation_tos_980_no3.pdf")
+# Adjust aspect ratio for a circular plot
+ax.set_aspect('equal')
+
+# Add colorbar
+cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
+cb.ax.tick_params(labelsize=20)
+
+# Significance testing
+df = 40
+sig = xr.DataArray(data=correlation_no3_no3 * np.sqrt((df - 2) / (1 - np.square(correlation_no3_no3))),
+                   dims=["lat", "lon"],
+                   coords=[lat, lon])
+t90 = stats.t.ppf(1 - 0.05, df - 2)
+t95 = stats.t.ppf(1 - 0.025, df - 2)
+
+# Plot significance contours
+sig.plot.contourf(ax=ax, levels=[-t95, -t90, t90, t95], colors='none',
+                  hatches=['..', None, None, '..'], extend='both', 
+                  add_colorbar=False, transform=ccrs.PlateCarree())
+
+# Set extent of the plot
+ax.set_extent([-180, 180, -90, -50], crs=ccrs.PlateCarree())
+
+plt.savefig("correlation_no3_no3.pdf")
 
 
-
-
-################################3 salinity and SSH
 
 
 infile = '/scratch/gpfs/gn5970/data/GFDL-ESM4_so_zos.nc'
 #data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
 data=xr.open_dataset(infile)
+print('data_so',data)
 import datetime
 data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
+data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
+min_lon = 0
+min_lat = -90
+min_depth = 0
+
+max_lon = 360
+max_lat = -50
+max_depth = 50
+
+mask_lon = (data.lon >= min_lon) & (data.lon <= max_lon)
+mask_lat = (data.lat >= min_lat) & (data.lat <= max_lat)
+#mask_depth = (data.depth >= min_depth) & (data.depth <= max_depth)
+data = data.where(mask_lat , drop=True)
+lon=np.array(data.lon)
+lat=np.array(data.lat)
+
+
+so_mean_GFDL=np.array(data.so.mean('time'))
 
 
 lat=data.lat
@@ -1298,33 +1587,67 @@ lat=np.array(data.lat)
 lon=np.array(data.lon)
 time=np.array(data.time)
 
-so_weighted =data.so
+# temperature weighted by grid-cell area
+so_weighted =data.so#(data.so*area) / total_area
 
 so_detrend=detrend_dim(so_weighted,dim='time')
 
 so_clim = so_detrend.groupby('time.month').mean(dim='time',skipna=True)
 so_anom = so_detrend.groupby('time.month') - so_clim
 #so_anom=so_anom.coarsen(time=3).mean()
+#so_anom=so_anom.coarsen(time=2).mean()
 so_anom2=so_anom/so_anom.std()
 A_so2=np.array(so_anom2)
 
-so_anom=wgt_areaave(so_anom,-90,-30,0,360)
+so_anom=wgt_areaave(so_anom,-90,-50,0,360)
 so_index=so_anom/so_anom.std()
-
-year=np.arange(1850,2015,1/12)
-plt.figure()
-so_index.plot()
-plt.xlabel('Year',fontsize=20)
-#plt.ylabel('NPP anomalies',fontsize=20)
-plt.xticks(fontsize=20)
-plt.yticks(fontsize=20)
-plt.tight_layout()
-plt.savefig('so_index.pdf')
-
-
 so_index=np.array(so_index)
 
 
+correlation_no3_so=[]
+for i in range(40):
+    for j in range(360):
+        #data_subset_no3 = no3_anom2.isel(lat=i,lon=j, drop=True)
+        data_subset_so = so_anom2.isel(lat=i,lon=j, drop=True)
+
+        correlation_no3_so.append(xr.corr(no3_index,data_subset_so))
+
+correlation_no3_so=np.array(correlation_no3_so)
+correlation_no3_so=correlation_no3_so.reshape(40,360)
+print('correlation',correlation_no3_so.shape)
+
+
+max_lag = 60  # Define the maximum lag you want to consider
+lags, correlations, p_values = lagged_correlation(no3_index, so_index, max_lag)
+
+# Convert to pandas DataFrame for better visualization
+correlation_df = pd.DataFrame({'Lag': lags, 'Correlation': correlations, 'p-value': p_values})
+
+# Plot the lagged correlation
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 6))
+plt.plot(correlation_df['Lag'], correlation_df['Correlation'], marker='o', label='Correlation')
+plt.axhline(0, color='grey', linestyle='--')
+plt.axhline(y=0.196, color='red', linestyle='--', label='Significance Level (p < 0.05)')
+plt.axhline(y=-0.196, color='red', linestyle='--')
+plt.grid(True)
+
+# Highlight significant correlations
+significance_level = 0.05
+significant = correlation_df['p-value'] < significance_level
+plt.scatter(correlation_df['Lag'][significant], correlation_df['Correlation'][significant], color='red', label='Significant (p < 0.05)')
+plt.ylabel("Correlation",fontsize=18, fontweight='bold')
+plt.xlabel("Lag",fontsize=18, fontweight='bold')
+plt.xticks(fontsize=18)
+plt.yticks(fontsize=18)
+plt.legend()
+plt.show()
+plt.savefig('no3_so_lag.pdf')
+
+
+
+
 for i in range(1):
     plt.figure(figsize=(10, 10),dpi=1200)
     plt.subplot(211)
@@ -1335,16 +1658,17 @@ for i in range(1):
     ax.coastlines(resolution='110m')
     ax.gridlines()
 
-    T_corr=correlation_map(no3_index,A_so2[:,:,:])
-    T_reg=np.divide(covariance_map(no3_index, A_so2[:,:,:]),np.var(no3_index))
+    #T_corr=correlation_map(no3_index,A_tos2[:,:,:])
+    #T_reg=np.divide(covariance_map(no3_index, A_tos2[:,:,:]),np.var(no3_index))
+
     # Define the yticks for latitude
     lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
+    #ax.yaxis.set_major_formatter(lat_formatter)
 
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
+    v = np.linspace(-0.6, 0.6, 40, endpoint=True)
 
     # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, T_corr, v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+    fill = ax.contourf(lon, lat, correlation_no3_so.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
 
     # Make the aspect ratio equal to get a circular plot
     ax.set_aspect('equal')
@@ -1353,61 +1677,21 @@ for i in range(1):
     cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
     font_size = 20  # Adjust as appropriate.
     cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg,color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+    #ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
     # Set the latitude limits
     df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
-      dims=["lat","lon'"],
+    sig=xr.DataArray(data=correlation_no3_so*np.sqrt((df-2)/(1-np.square(correlation_no3_so))),
+      dims=["lat","lon"],
       coords=[lat, lon])
     t90=stats.t.ppf(1-0.05, df-2)
     t95=stats.t.ppf(1-0.025, df-2)
     sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
       hatches=['..', None, None, None, '..'], extend='both',
       add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
+    ax.set_extent([-180, 180, -90, -50], crs=ccrs.PlateCarree())
 plt.savefig("correlation_so_no3.pdf")
 
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
 
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-
-    T_corr=correlation_map(no3_index[-990:],A_so2[-990:,:,:])
-    T_reg=np.divide(covariance_map(no3_index[-990:], A_so2[-990:,:,:]),np.var(no3_index[-990:]))
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, T_corr, v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
-
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg,color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
-      dims=["lat","lon'"],
-      coords=[lat, lon])
-    t90=stats.t.ppf(1-0.05, df-2)
-    t95=stats.t.ppf(1-0.025, df-2)
-    sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
-      hatches=['..', None, None, None, '..'], extend='both',
-      add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("correlation_so_980_no3.pdf")
 
 
 lat=np.array(data.lat)
@@ -1419,11 +1703,11 @@ zos_weighted =data.zos#(data.zos*area) / total_area
 zos_detrend=detrend_dim(zos_weighted,dim='time')
 zos_clim = zos_detrend.groupby('time.month').mean(dim='time',skipna=True)
 zos_anom = zos_detrend.groupby('time.month') - zos_clim
-#zos_anom=zos_anom.coarsen(time=3).mean()
+#zos_anom=zos_anom.coarsen(time=2).mean()
 zos_anom2=zos_anom/zos_anom.std()
 
 A_zos=np.array(zos_anom2)
-zos_anom=wgt_areaave(zos_anom,-90,-30,0,360)
+zos_anom=wgt_areaave(zos_anom,-90,-50,0,360)
 zos_index=zos_anom/zos_anom.std()
 
 year=np.arange(1850,2015,1/12)
@@ -1437,14 +1721,116 @@ plt.tight_layout()
 plt.savefig('zos_index.pdf')
 
 
-zos_index=np.array(zos_index)
 
-coslat = np.cos(np.deg2rad(lat))
-wgts = np.sqrt(coslat)[..., np.newaxis]
-solver = EofSolver(A_zos[:,:,:], weights=wgts)
-eof1_zos = solver.eofs(neofs=20, eofscaling=2)
-pc1_zos= solver.pcs(npcs=20, pcscaling=1)
-variance=solver.varianceFraction()
+max_lag = 60  # Define the maximum lag you want to consider
+lags, correlations, p_values = lagged_correlation(no3_index, zos_index, max_lag)
+
+# Convert to pandas DataFrame for better visualization
+correlation_df = pd.DataFrame({'Lag': lags, 'Correlation': correlations, 'p-value': p_values})
+
+# Plot the lagged correlation
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 6))
+plt.plot(correlation_df['Lag'], correlation_df['Correlation'], marker='o', label='Correlation')
+plt.axhline(0, color='grey', linestyle='--')
+plt.axhline(y=0.196, color='red', linestyle='--', label='Significance Level (p < 0.05)')
+plt.axhline(y=-0.196, color='red', linestyle='--')
+plt.xlabel('Lag')
+plt.ylabel('Correlation')
+plt.grid(True)
+# Highlight significant correlations
+significance_level = 0.05
+significant = correlation_df['p-value'] < significance_level
+plt.scatter(correlation_df['Lag'][significant], correlation_df['Correlation'][significant], color='red', label='Significant (p < 0.05)')
+
+plt.legend()
+plt.show()
+plt.savefig('no3_zos_lag.pdf')
+
+
+infile = '/scratch/gpfs/gn5970/data/GFDL-ESM4-siconc.nc'
+#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
+data=xr.open_dataset(infile)
+print('data_siconc',data)
+import datetime
+data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
+data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
+min_lon = 0
+min_lat = -90
+min_depth = 0
+
+max_lon = 360
+max_lat = -50
+max_depth = 50
+
+mask_lon = (data.lon >= min_lon) & (data.lon <= max_lon)
+mask_lat = (data.lat >= min_lat) & (data.lat <= max_lat)
+#mask_depth = (data.depth >= min_depth) & (data.depth <= max_depth)
+data = data.where(mask_lat , drop=True)
+lon=np.array(data.lon)
+lat=np.array(data.lat)
+
+
+#siconc_mean_GFDL=np.array(data.siconc.mean('time'))
+siconc_weighted =data.siconc#(data.zos*area) / total_area
+
+siconc_detrend=detrend_dim(siconc_weighted,dim='time')
+siconc_clim = siconc_detrend.groupby('time.month').mean(dim='time',skipna=True)
+siconc_anom = siconc_detrend.groupby('time.month') - siconc_clim
+#zos_anom=zos_anom.coarsen(time=2).mean()
+siconc_anom2=siconc_anom/siconc_anom.std()
+
+A_siconc=np.array(siconc_anom2)
+siconc_anom=wgt_areaave(siconc_anom,-90,-50,0,360)
+siconc_index=siconc_anom/siconc_anom.std()
+
+max_lag = 60  # Define the maximum lag you want to consider
+lags, correlations, p_values = lagged_correlation(no3_index,siconc_index, max_lag)
+
+# Convert to pandas DataFrame for better visualization
+correlation_df = pd.DataFrame({'Lag': lags, 'Correlation': correlations, 'p-value': p_values})
+
+# Plot the lagged correlation
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 6))
+plt.plot(correlation_df['Lag'], correlation_df['Correlation'], marker='o', label='Correlation')
+plt.axhline(0, color='grey', linestyle='--')
+plt.axhline(y=0.196, color='red', linestyle='--', label='Significance Level (p < 0.05)')
+plt.axhline(y=-0.196, color='red', linestyle='--')
+
+plt.xlabel('Lag')
+plt.ylabel('Correlation')
+plt.title('Lagged Correlation between NO3 and Salt')
+plt.grid(True)
+
+# Highlight significant correlations
+significance_level = 0.05
+significant = correlation_df['p-value'] < significance_level
+plt.scatter(correlation_df['Lag'][significant], correlation_df['Correlation'][significant], color='red', label='Significant (p < 0.05)')
+plt.ylabel("Correlation",fontsize=18)
+plt.xlabel("Lag",fontsize=18)
+plt.xticks(fontsize=18)
+plt.yticks(fontsize=18)
+plt.legend()
+plt.show()
+plt.savefig('no3_si_lag.pdf')
+
+
+
+correlation_no3_zos=[]
+for i in range(40):
+    for j in range(360):
+        data_subset_no3 = no3_anom2.isel(lat=i,lon=j, drop=True)
+        data_subset_zos = zos_anom2.isel(lat=i,lon=j, drop=True)
+
+        correlation_no3_zos.append(xr.corr(no3_index,data_subset_zos))
+
+correlation_no3_zos=np.array(correlation_no3_zos)
+correlation_no3_zos=correlation_no3_zos.reshape(40,360)
+print('correlation',correlation_no3_zos.shape)
+
 
 
 
@@ -1459,14 +1845,17 @@ for i in range(1):
     ax.coastlines(resolution='110m')
     ax.gridlines()
 
+    #T_corr=correlation_map(no3_index,A_tos2[:,:,:])
+    #T_reg=np.divide(covariance_map(no3_index, A_tos2[:,:,:]),np.var(no3_index))
+
     # Define the yticks for latitude
     lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
+    #ax.yaxis.set_major_formatter(lat_formatter)
 
-    v = np.linspace(-0.7, 0.7, 40, endpoint=True)
+    v = np.linspace(-0.6, 0.6, 40, endpoint=True)
 
     # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, (eof1_zos[0,:,:]*np.nanstd(pc1_zos[:,0],axis=0)), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+    fill = ax.contourf(lon-180, lat, correlation_no3_zos.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
 
     # Make the aspect ratio equal to get a circular plot
     ax.set_aspect('equal')
@@ -1475,287 +1864,46 @@ for i in range(1):
     cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
     font_size = 20  # Adjust as appropriate.
     cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-    ax.contour(lon,lat, (eof1_zos[0,:,:]*np.nanstd(pc1_zos[:,0],axis=0)),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-plt.savefig("eof1_zos_final.pdf")
-
-
-
-plt.figure()
-year=np.arange(1850,2015,1/12)
-plt.plot(year,pc1_zos[:,0]/np.nanstd(pc1_zos[:,0],axis=0))
-plt.xticks(fontsize=20)
-plt.yticks(fontsize=20)
-plt.xticks(rotation=45)
-plt.savefig("pc1_zos_final.png")
-
-
-
-
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
-    T_corr=correlation_map(no3_index,A_zos[:,:,:])
-    T_reg=np.divide(covariance_map(no3_index, A_zos[:,:,:]),np.var(no3_index))
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, T_corr, v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
-
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg,color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
+    #ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
     # Set the latitude limits
     df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
-      dims=["lat","lon'"],
-      coords=[lat, lon])
+    sig=xr.DataArray(data=correlation_no3_zos*np.sqrt((df-2)/(1-np.square(correlation_no3_zos))),
+      dims=["lat","lon"],
+      coords=[lat, lon-180])
     t90=stats.t.ppf(1-0.05, df-2)
     t95=stats.t.ppf(1-0.025, df-2)
     sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
       hatches=['..', None, None, None, '..'], extend='both',
       add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
+    ax.set_extent([-180, 180, -90, -50], crs=ccrs.PlateCarree())
 plt.savefig("correlation_zos_no3.pdf")
 
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
-    T_corr=correlation_map(no3_index[-990:],A_zos[-990:,:,:])
-    T_reg=np.divide(covariance_map(no3_index[-990:], A_zos[-990:,:,:]),np.var(no3_index[-990:]))
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, T_corr, v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
-
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg,color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
-      dims=["lat","lon'"],
-      coords=[lat, lon])
-    t90=stats.t.ppf(1-0.05, df-2)
-    t95=stats.t.ppf(1-0.025, df-2)
-    sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
-      hatches=['..', None, None, None, '..'], extend='both',
-      add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("correlation_zos_980_no3.pdf")
 
 
-
-
-
-
-
-### upward velocity flux
-#infile = '/projects/CDEUTSCH/DATA/ocean_monthly_z.static.nc'
-#data_stat=xr.open_dataset(infile)
-#grid_model = xr.Dataset()
-#grid_model['lon'] = data_stat['geolon_v']
-#grid_model['lat'] = data_stat['geolat_v']
-
-
-#infile = '/scratch/gpfs/gn5970/data/vmo_total.nc'
-#data=xr.open_dataset(infile)
-#vmo=data.vmo
-#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
-#print("vmo",vmo)
-
-
-
-#z=np.array(data.z_l)
-#lat=np.array(data.yq)
-
-#grid_1x1  = xr.Dataset({'lat': (['lat'], np.linspace(-90, 90, 180)), 'lon': (['lon'], np.linspace(0, 360, 360))})
-#regrid_to_1x1 = xe.Regridder(grid_model, grid_1x1, 'bilinear', periodic=True)
-
-#vmo = regrid_to_1x1(vmo, keep_attrs=True)
-
-#min_lat = -90
-
-#max_lon = 360
-#max_lat =  -30
-#min_z=0
-#max_z=50
-#mask_z = (vmo.z_l >= min_z) & (vmo.z_l <= max_z)
-
-#mask_lat = (vmo.lat >= min_lat) & (vmo.lat <= max_lat)
-
-#vmo = vmo.where(mask_lat & mask_z, drop=True)
-#vmo=vmo.mean('z_l')
-
-#infile = '/projects/CDEUTSCH/DATA/ocean_monthly_z.static.nc'
-#data_stat=xr.open_dataset(infile)
-#grid_model = xr.Dataset()
-#grid_model['lon'] = data_stat['geolon_u']
-#grid_model['lat'] = data_stat['geolat_u']
-
-
-#infile = '/scratch/gpfs/gn5970/data/umo_total.nc'
-#data=xr.open_dataset(infile)
-#umo=data.umo
-#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
-#print("umo",umo)
-
-
-
-#z=np.array(data.z_l)
-#lat=np.array(data.yq)
-
-#grid_1x1  = xr.Dataset({'lat': (['lat'], np.linspace(-90, 90, 180)), 'lon': (['lon'], np.linspace(0, 360, 360))})
-#regrid_to_1x1 = xe.Regridder(grid_model, grid_1x1, 'bilinear', periodic=True)
-
-#umo = regrid_to_1x1(umo, keep_attrs=True)
-
-#min_lat = -90
-
-
-#max_lon = 360
-#max_lat =  -30
-#min_z=0
-#max_z=50
-#mask_z = (umo.z_l >= min_z) & (umo.z_l <= max_z)
-#mask_lat = (umo.lat >= min_lat) & (vmo.lat <= max_lat)
-
-#umo = umo.where(mask_lat & mask_z, drop=True)
-#umo=umo.mean('z_l')
-
-#rho_0=1035
-
-#u=np.zeros((1980,60,360))
-#v=np.zeros((1980,60,360))
-#for i in range(60):
-#    for j in range(360):
-
-#        u[:,i,j]=np.divide(umo[:,i,j],rho_0*area[i,j])
-#        v[:,i,j]=np.divide(vmo[:,i,j],rho_0*area[i,j])
-
-#udev=np.zeros((1980,60,360))
-#vdev=np.zeros((1980,60,360))
-#umodev=np.zeros((1980,60,360))
-#vmodev=np.zeros((1980,60,360))
-#wmo=np.zeros((1980,60,360))
-#w=np.zeros((1980,60,360))
-#dx=1
-
-#wmo=calc_w_from_convergence(umo,vmo)
-
-#for i in range(1,59):
-#    for j in range(1, 359):
-#        udev[:, i, j] = (u[:, i+1, j]-u[:, i-1,j]) / (dx)
-#        vdev[:, i, j] = (v[:, i, j+1]-v[:, i,j-1]) / (dx)
-
-#        umodev[:, i, j]=(umo[:, i+1, j]-umo[:, i-1,j]) / (dx)
-#        vmodev[:, i, j]=(vmo[:, i+1, j]-vmo[:, i-1,j]) / (dx)
-
-#        w[:,i,j]=-(udev[:, i, j]+vdev[:, i, j])*50
-#        wmo[:,i,j]=-(umodev[:, i, j]+vmodev[:, i, j])*50
-
-#wmo=xr.DataArray(wmo)
-#wmo = wmo.rename({'dim_0': 'time'})
-#wmo = wmo.rename({'dim_1': 'z'})
-#wmo = wmo.rename({'dim_2': 'lat'})
-#wmo = wmo.rename({'dim_3': 'lon'})
-#wmo=wmo.mean("z")
-#wmo['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
-
-#wmo_weighted =(wmo*area) / total_area
-#anomalies=detrend_dim(wmo_weighted,dim='time')
-#anomalies= wmo.groupby('time.month')-wmo.groupby('time.month').mean('time',skipna=True)
-#anomalies=anomalies.coarsen(time=3).mean()
-
-#mask=anomalies.notnull()
-#anomalies=anomalies/anomalies.std()
-
-#w_anom=wgt_areaave(anomalies,-90,-30,0,360)
-#w_anom=w_anom/w_anom.std()
-#w_anom=np.array(w_anom)
-#print("w",w_anom)
-#anomalies=np.array(anomalies)
-#print("anomalies",anomalies.shape)
-#anomalies=anomalies.reshape(720,60,360)
-#anomalies=anomalies.transpose('variable','time','lat','lon')
-#anomalies=anomalies.mean('variable')
-#from eofs.xarray import Eof
-
-#A_wmo=np.array(anomalies)
-#print("A1",A1)
-#solver = EofSolver(A_wmo, weights=wgts)
-#eof1_wmo = solver.eofs(neofs=6)
-#pc1_wmo = solver.pcs(npcs=6, pcscaling=1)
-
-#fig, axarr = plt.subplots(nrows=2, figsize=[2,10])
-#for i in range(1):
-    #T_corr=correlation_map(np.roll(pc1_wmo[:,0]/np.nanstd(pc1_wmo[:,0],axis=0),i),A_no3[:,:,:])
-    #T_reg=np.divide(covariance_map(np.roll(pc1_wmo[:,0]/np.nanstd(pc1_wmo[:,0],axis=0),i), A_no3[:,:,:]),np.var(np.roll(pc1_wmo[:,0]/np.nanstd(pc1_wmo[:,0],axis=0),i)))
-#    T_corr=correlation_map(no3_index,A_wmo[:,:,:])
-#    T_reg=np.divide(covariance_map(no3_index, A_wmo[:,:,:]),np.var(no3_index))
-
-#    plt.figure(figsize=(13,6.2))
-#    plt.subplot(211)
-#    ax=fig.add_axes([0.1,0.1,0.8,0.8])
-#    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-#    ax.coastlines(resolution='110m')
-#    ax.gridlines()
-#    #ax.set_xticks(np.arange(-180,180,20), crs=ccrs.PlateCarree())
-#    lon_formatter = cticker.LongitudeFormatter()
-#    #ax.xaxis.set_major_formatter(lon_formatter)
-#    # Define the yticks for latitude
-#    plt.title("correlation map  NO3 and SSH")
-#    lat_formatter = cticker.LatitudeFormatter()
-#    ax.yaxis.set_major_formatter(lat_formatter)
-#    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-#    fill=ax.contourf(lon,lat,T_corr.squeeze(),v,cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-#    ax.set_aspect('auto')
-#    cb = plt.colorbar(fill, orientation='vertical',shrink=1.1)
-#    font_size = 20 # Adjust as appropriate.
-#    cb.ax.tick_params(labelsize=font_size)
-#    ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-#    polarCentral_set_latlim([-90,-30], ax)
-#plt.savefig("correlation_no3_w_GFDL.png")
-
-
+zos_index=np.array(zos_index)
+no3_index=np.array(no3_index)
 
 infile = '/scratch/gpfs/gn5970/mld-GFDL-ESM4.nc'
 #data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
 data=xr.open_dataset(infile)
+
+
 import datetime
 data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
+min_lon = 0
+min_lat = -90
+min_depth = 0
+
+max_lon = 360
+max_lat = -50
+max_depth = 50
+
+mask_lon = (data.lon >= min_lon) & (data.lon <= max_lon)
+mask_lat = (data.lat >= min_lat) & (data.lat <= max_lat)
+#mask_depth = (data.depth >= min_depth) & (data.depth <= max_depth)
+data = data.where(mask_lat , drop=True)
+
+
 lat=np.array(data.lat)
 lon=np.array(data.lon)
 
@@ -1775,14 +1923,14 @@ from eofs.xarray import Eof
 
 A_mld=np.array(anomalies2)
 
-
 mld_weighted =data.mlotst#(data.mlotst*area) / total_area
 mld_detrend=detrend_dim(mld_weighted,dim='time')
 
 anomalies= mld_detrend.groupby('time.month')-mld_detrend.groupby('time.month').mean('time',skipna=True)
 
-anomalies=wgt_areaave(anomalies,-90,-30,0,360)
-mld_index=anomalies/anomalies.std()
+anomalies=wgt_areaave(anomalies,-90,-50,0,360)
+mld_index=anomalies#.coarsen(time=2).mean()
+mld_index=mld_index/mld_index.std()
 
 year=np.arange(1850,2015,1/12)
 plt.figure()
@@ -1795,93 +1943,36 @@ plt.tight_layout()
 plt.savefig('mld_index.pdf')
 
 
-mld_index=np.array(mld_index)
+max_lag = 60  # Define the maximum lag you want to consider
+lags, correlations, p_values = lagged_correlation(no3_index, mld_index, max_lag)
 
-solver = EofSolver(A_mld, weights=None)
-eof1_mld = solver.eofs(neofs=6)
-pc1_mld = solver.pcs(npcs=6, pcscaling=1)
+# Convert to pandas DataFrame for better visualization
+correlation_df = pd.DataFrame({'Lag': lags, 'Correlation': correlations, 'p-value': p_values})
 
+# Plot the lagged correlation
+import matplotlib.pyplot as plt
 
+plt.figure(figsize=(10, 6))
+plt.plot(correlation_df['Lag'], correlation_df['Correlation'], marker='o', label='Correlation')
+plt.axhline(0, color='grey', linestyle='--')
+plt.axhline(y=0.196, color='red', linestyle='--', label='Significance Level (p < 0.05)')
+plt.axhline(y=-0.196, color='red', linestyle='--')
 
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
-    T_corr=correlation_map(no3_index,A_mld[:,:,:])
-    T_reg=np.divide(covariance_map(no3_index, A_mld[:,:,:]),np.var(no3_index))
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-
-    v = np.linspace(-0.7, 0.7, 40, endpoint=True)
-
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, T_corr, v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
-
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg,color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
-      dims=["lat","lon'"],
-      coords=[lat, lon])
-    t90=stats.t.ppf(1-0.05, df-2)
-    t95=stats.t.ppf(1-0.025, df-2)
-    sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
-      hatches=['..', None, None, None, '..'], extend='both',
-      add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("correlation_mld_no3.pdf")
+# Highlight significant correlations
+plt.grid(True)
+significance_level = 0.05
+significant = correlation_df['p-value'] < significance_level
+plt.scatter(correlation_df['Lag'][significant], correlation_df['Correlation'][significant], color='red', label='Significant (p < 0.05)')
+plt.xlabel("Lag",fontsize=18, fontweight='bold')
+plt.ylabel("Correlation",fontsize=18, fontweight='bold')
+plt.xticks(fontsize=18)
+plt.yticks(fontsize=18)
+plt.legend()
+plt.show()
+plt.savefig('no3_mld_lag.pdf')
 
 
 
-wgts = np.sqrt(coslat)[..., np.newaxis]
-solver = EofSolver(A_mld[:,:,:], weights=None)
-eof1_mld = solver.eofs(neofs=20, eofscaling=2)
-pc1_mld= solver.pcs(npcs=20, pcscaling=1)
-#variance=solver.varianceFraction(
-
-fig, axarr = plt.subplots(nrows=2, figsize=[2,10])
-
-for i in range(1):
-    #T_corr=correlation_map(np.roll(X_no3,i),A[:,:,:])
-    #T_reg=np.divide(covariance_map(np.roll(X_no3,i), A[:,:,:]),np.var(np.roll(X_no3,i)))
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
-    ax=fig.add_axes([0.1,0.1,0.8,0.8])
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-    #ax.set_xticks(np.arange(-180,180,20), crs=ccrs.PlateCarree())
-    lon_formatter = cticker.LongitudeFormatter()
-    #ax.xaxis.set_major_formatter(lon_formatter)
-    # Define the yticks for latitude
-    plt.title("EOF1 WSC")
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-    fill=ax.contourf(lon,lat,(eof1_mld[0,:,:]*np.nanstd(pc1_mld[:,0],axis=0)),v,cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    ax.set_aspect('auto')
-    cb = plt.colorbar(fill, orientation='vertical',shrink=1.1)
-    font_size = 20 # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, (eof1_mld[0,:,:]*np.nanstd(pc1_mld[:,0],axis=0)),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    polarCentral_set_latlim([-90,-30], ax)
-plt.savefig("eof1_mld_final.pdf")
-
-# wind stress curl
-print("grid",Grid)
 
 infile = '/projects/CDEUTSCH/DATA/ocean_monthly_z.static.nc'
 ds=xr.open_dataset(infile)
@@ -1891,7 +1982,7 @@ grid_model['lat'] = ds['geolat_c']
 print("grid",ds)
 
 min_lat = -90
-max_lat =  -30
+max_lat =  -50
 
 infile = '/projects/CDEUTSCH/DATA/tauuo-GFDL-ESM4.nc'
 #data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
@@ -1908,69 +1999,13 @@ taux['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
 
 lon_wsc=np.array(taux.x)
 lat_wsc=np.array(taux.y)
-import datetime
-#print("taux_cut",taux_cut)
-
-
 
 infile = '/projects/CDEUTSCH/DATA/tauvo-GFDL-ESM4.nc'
 #data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
 tauy=xr.open_dataset(infile)
 tauy=tauy.tauvo
 tauy['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
-#min_lat = -90
 
-#max_lat =  -30
-
-#mask_lat = (tauy.y >= min_lat) & (tauy.y <= max_lat)
-
-#tauy = tauy.where(mask_lat, drop=True)
-
-
-#tauy_dev=tauy.diff(dim='lat', n=1, label='upper')
-#taux_dev=taux.diff(dim='lon', n=1, label='upper')
-
-import metpy.calc as mp 
-#txx, txy = mp.geospatial_gradient(taux_cut.tauuo)
-#taux_y = taux_cut.tauuo.copy(deep=True, data=np.array(txy))
-def wind_stress_curl(Tx, Ty, x, y,tdim=0,  ydim=1, xdim=2):
-    """Calculate the curl of wind stress (Tx, Ty).
-
-    Args:
-        Tx, Ty: Wind stress components (N/m^2), 2d or 3d (for time series)
-        x, y: Coordinates in lon/lat (degrees), 2d.
-
-    Notes:
-        Curl(Tx,Ty) = dTy/dx - dTx/dy
-        The different constants come from oblateness of the ellipsoid.
-
-    """
-    dy = np.abs(y[1,0] - y[0,0]) # scalar in deg
-    dx = np.abs(x[0,1] - x[0,0])
-    dy *= 110575. # scalar in m
-    dx *= 111303. * np.cos(y[:,0] * np.pi/180) # array in m (varies w/lat)
-
-    # extend dimension for broadcasting (2d -> 3d)
-    #if Tx.ndim == 3:
-    #    dx = np.expand_dims(dx, tdim)
-
-    # grad[f(y,x), delta] = diff[f(y)]/delta, diff[f(x)]/delta 
-    dTxdy = np.gradient(Tx, dy)[ydim] # (N/m^3)
-    dTydx = np.gradient(Ty, np.mean(dx,axis=0))[xdim]
-    return dTxdy,dTydx
-
-#tyx, tyy = mp.geospatial_gradient(tauy_cut.tauvo)
-#tauy_x = tauy_cut.tauvo.copy(deep=True, data=np.array(tyx))
-
-#wsc=np.zeros((1980,60,288))
-#for i in range(60):
-#    for j in range(288):
-#        wsc[:,i,j]=(tauy_dev[:, i, j]-taux_dev[:, i, j])
-
-import pandas as pd
-import xesmf as xe
-
-# regrid taux and tauy
 grid_1x1=xe.util.grid_global(1,1)
 
 grid_1x1['y']=grid_1x1['y']-90
@@ -2023,12 +2058,6 @@ def div_4pt_xr(U, V):
 
 rho0 = 1028
 
-#f_total=np.zeros((180,360))
-#for i in range(180):
-#    for j in range(360):
-#        f_total[i,j]=f[i]
-
-
 
 dx=(2*np.pi)/360
 dy=(2*np.pi)/360
@@ -2053,7 +2082,7 @@ def z_curl_xr(U, V, dx, dy, lat_wsc):
     return zcurl, Udy, Vdx
 
 ekman_pumping, Udy, Vdx = z_curl_xr(taux3 / (rho0 * fx), tauy3 / (rho0 * fy), dx, dy, lat_wsc)
-ekman_pumping=ekman_pumping.sel(lat=slice(-90,-30))
+ekman_pumping=ekman_pumping.sel(lat=slice(-90,-50))
 ekman_pumping=ekman_pumping.transpose('time','lat','lon')
 ekman_pumping['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
 lon_ep=ekman_pumping.lon
@@ -2070,8 +2099,8 @@ A_ekman_pumping=np.array(ekman_pumping_anom)
 ekman_pumping_weighted=detrend_dim(ekman_pumping,dim='time')
 ekman_pumping_clim = ekman_pumping_weighted.groupby('time.month').mean(dim='time',skipna=True)
 ekman_pumping_anom = ekman_pumping_weighted.groupby('time.month') - ekman_pumping_clim
-ekman_pumping_index=wgt_areaave(ekman_pumping_anom,-90,-30,0,360)
-
+ekman_pumping_index=wgt_areaave(ekman_pumping_anom,-90,-50,0,360)
+#ekman_pumping_index=ekman_pumping_index.coarsen(time=2).mean()
 ekman_pumping_index=ekman_pumping_index/ekman_pumping_index.std()
 
 year=np.arange(1850,2015,1/12)
@@ -2084,193 +2113,78 @@ plt.yticks(fontsize=20)
 plt.tight_layout()
 plt.savefig('ek_index.pdf')
 
-#print("A1",A1
-#wsc_anom=wgt_areaave(wsc_anom,-90,-30,0,360)
-#print("anomalies_wsc",A_ekman_pumping)
-#wsc_index=wsc_anom/wsc_anom.std()
 
-#tauy_detrend[:,:,:] = np.nan
-#for i in range(59):
-#    for j in range(359):
-#        ytemp = np.copy(tauy_regrid[:,i,j])
-#        y = tauy_regrid[:,i,j]
-#        b = ~np.isnan(y)
-#        tauy_detrend[b,i,j] = y[b]
+max_lag = 60  # Define the maximum lag you want to consider
+lags, correlations, p_values = lagged_correlation(no3_index, ekman_pumping_index, max_lag)
 
-def polarCentral_set_latlim2(lat_lims, ax):
-    ax.set_extent([0, 360, lat_lims[0], lat_lims[1]], ccrs.PlateCarree())
-    # Compute a circle in axes coordinates, which we can use as a boundary
-    # for the map. We can pan/zoom as much as we like - the boundary will be
-    # permanently circular.
-    theta = np.linspace(0, 2*np.pi, 100)
-    center, radius = [0.5, 0.5], 0.5
-    verts = np.vstack([np.sin(theta), np.cos(theta)]).T
-    circle = mpath.Path(verts * radius + center)
+# Convert to pandas DataFrame for better visualization
+correlation_df = pd.DataFrame({'Lag': lags, 'Correlation': correlations, 'p-value': p_values})
 
-    ax.set_boundary(circle, transform=ax.transAxes)
+# Plot the lagged correlation
+import matplotlib.pyplot as plt
 
-#wsc = np.empty(taux_regrid.shape)
+plt.figure(figsize=(10, 6))
+plt.plot(correlation_df['Lag'], correlation_df['Correlation'], marker='o', label='Correlation')
+plt.axhline(0, color='grey', linestyle='--')
+plt.axhline(y=0.196, color='red', linestyle='--', label='Significance Level (p < 0.05)')
+plt.axhline(y=-0.196, color='red', linestyle='--')
+
+plt.grid(True)
+
+# Highlight significant correlations
+significance_level = 0.05
+significant = correlation_df['p-value'] < significance_level
+plt.scatter(correlation_df['Lag'][significant], correlation_df['Correlation'][significant], color='red', label='Significant (p < 0.05)')
+plt.ylabel("Correlation",fontsize=18, fontweight='bold')
+plt.xlabel("Lag",fontsize=18, fontweight='bold')
+plt.xticks(fontsize=18)
+plt.yticks(fontsize=18)
+plt.legend()
+plt.show()
+plt.savefig('no3_ep_lag.pdf')
 
 
-
-
-
-infile = '/projects/CDEUTSCH/DATA/npp-GFDL-ESM4.nc'
+infile = '/scratch/gpfs/gn5970/data/GFDL-ESM4_tos_no3.nc'
 #data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
-npp=xr.open_dataset(infile)
+data=xr.open_dataset(infile)
 import datetime
-npp['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
 
-npp=npp#*area)/ total_area
-anomalies= npp.groupby('time.month')-npp.groupby('time.month').mean('time',skipna=True)
+data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
+data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
+min_lon = 0
+min_lat = -90
+min_depth = 0
 
+max_lon = 360
+max_lat = -50
+max_depth = 50
 
-anomalies=anomalies.to_array()
-anomalies=xr.DataArray(anomalies)
-anomalies=detrend_dim(anomalies,dim='time')
-
-A_npp=np.array(anomalies/anomalies.std())
-A_npp=A_npp.reshape(1980,60,360)
-
-anomalies=wgt_areaave(anomalies,-90,-30,0,360)
-npp_index=anomalies/anomalies.std()
-npp_index=np.array(npp_index)
-
+mask_lon = (data.lon >= min_lon) & (data.lon <= max_lon)
+mask_lat = (data.lat >= min_lat) & (data.lat <= max_lat)
+#mask_depth = (data.depth >= min_depth) & (data.depth <= max_depth)
+data = data.where(mask_lat , drop=True)
 
 
-Z=anomalies
-X_npp=Z/Z.std()
-year=np.arange(1850,2015,1/12)
-plt.figure()
-X_npp.plot()
-plt.xlabel('Year',fontsize=20)
-plt.ylabel('NPP anomalies',fontsize=20)
-plt.xticks(fontsize=20)
-plt.yticks(fontsize=20)
-plt.tight_layout()
-plt.savefig("npp_index_GFDL.pdf")
 
-fig, axarr = plt.subplots(nrows=2, figsize=[2,10])
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    #T_corr=correlation_map(np.roll(pc1_wsc[:,0]/np.nanstd(pc1_wsc[:,0],axis=0),i),A_no3[:,:,:])
-    #T_reg=np.divide(covariance_map(np.roll(pc1_wsc[:,0]/np.nanstd(pc1_wsc[:,0],axis=0),i), A_no3[:,:,:]),np.var(np.roll(pc1_wsc[:,0]/np.nanstd(pc1_wsc[:,0],axis=0),i)))
-    T_corr=correlation_map(no3_index,A_npp[:,:,:])
-    T_reg=np.divide(covariance_map(no3_index, A_npp[:,:,:]),np.var(no3_index))
+infile = '/scratch/gpfs/gn5970/data/GFDL-ESM4_so_zos.nc'
+#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
+data2=xr.open_dataset(infile)
+import datetime
+data2['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
+min_lon = 0
+min_lat = -90
+min_depth = 0
 
-    plt.figure(figsize=(13,6))
-    plt.subplot(211)
-    ax=fig.add_axes([0.1,0.1,0.8,0.8])
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-    #ax.set_xticks(np.arange(-180,180,20), crs=ccrs.PlateCarree())
-    lon_formatter = cticker.LongitudeFormatter()
-    #ax.xaxis.set_major_formatter(lon_formatter)
-    # Define the yticks for latitude
-    #plt.title("correlation map  NO3 and NPP")
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-    fill=ax.contourf(lon,lat,T_corr.squeeze(),v,cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    ax.set_aspect('auto')
-    cb = plt.colorbar(fill, orientation='vertical',shrink=1.1)
-    font_size = 20 # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    polarCentral_set_latlim([-90,-30], ax)
-plt.savefig("correlation_no3_npp_GFDL_"+str(i)+".pdf")
+max_lon = 360
+max_lat = -50
+max_depth = 50
 
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
-
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-
-    T_corr=correlation_map(no3_index,A_no3[:,:,:])
-    T_reg=np.divide(covariance_map(no3_index, A_no3[:,:,:]),np.var(no3_index))
-
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, T_corr.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
-
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
-      dims=["lat","lon'"],
-      coords=[lat, lon])
-    t90=stats.t.ppf(1-0.05, df-2)
-    t95=stats.t.ppf(1-0.025, df-2)
-    sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
-      hatches=['..', None, None, None, '..'], extend='both',
-      add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("correlation_no3_no3_GFDL_"+str(i)+".pdf")
-
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
-
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-
-    T_corr=correlation_map(no3_index[-990:],A_no3[-990:,:,:])
-    T_reg=np.divide(covariance_map(no3_index[-990:], A_no3[-990:,:,:]),np.var(no3_index[-990:]))
-
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, T_corr.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
-
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
-      dims=["lat","lon'"],
-      coords=[lat, lon])
-    t90=stats.t.ppf(1-0.05, df-2)
-    t95=stats.t.ppf(1-0.025, df-2)
-    sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
-      hatches=['..', None, None, None, '..'], extend='both',
-      add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("correlation_no3_no3_980_GFDL_"+str(i)+".pdf")
+mask_lon = (data2.lon >= min_lon) & (data2.lon <= max_lon)
+mask_lat = (data2.lat >= min_lat) & (data2.lat <= max_lat)
+#mask_depth = (data.depth >= min_depth) & (data.depth <= max_depth)
+data2 = data2.where(mask_lat , drop=True)
 
 
-npp_index=np.array(X_npp)
-print("npp_index",npp_index.shape)
-#### buoyancy
 
 def pdens(S,theta):
 
@@ -2305,20 +2219,6 @@ def pdens(S,theta):
 
     return pot_dens
 
-infile = '/scratch/gpfs/gn5970/data/GFDL-ESM4_tos_no3.nc'
-#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
-data=xr.open_dataset(infile)
-import datetime
-data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
-
-infile = '/scratch/gpfs/gn5970/data/GFDL-ESM4_so_zos.nc'
-#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
-data2=xr.open_dataset(infile)
-import datetime
-data2['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
-
-
-
 pt = xr.apply_ufunc(pdens, data2.so, data.tos,
                     dask='parallelized',
                     output_dtypes=[data2.so.dtype])
@@ -2340,106 +2240,61 @@ b_anom2=b_anom/b_anom.std()
 
 A_b=np.array(b_anom2)
 
-b_anom=wgt_areaave(b_anom,-90,-30,0,360)
+b_anom=wgt_areaave(b_anom,-90,-50,0,360)
+#b_anom=b_anom.coarsen(time=2).mean()
 b_index=b_anom/b_anom.std()
 
 year=np.arange(1850,2015,1/12)
 plt.figure(figsize=(10, 10),dpi=1200)
 b_index.plot()
-plt.xlabel('Year',fontsize=20)
-#plt.ylabel('NPP anomalies',fontsize=20)
-plt.xticks(fontsize=20)
-plt.yticks(fontsize=20)
-plt.tight_layout()
+
 plt.savefig('b_index.pdf')
 
-
-
 b_index=np.array(b_index)
+max_lag = 60  # Define the maximum lag you want to consider
+lags, correlations, p_values = lagged_correlation(no3_index, b_index, max_lag)
 
-coslat = np.cos(np.deg2rad(lat))
-wgts = np.sqrt(coslat)[..., np.newaxis]
-solver = EofSolver(A_b[:,:,:], weights=wgts)
-eof1_b = solver.eofs(neofs=20, eofscaling=2)
-pc1_b= solver.pcs(npcs=20, pcscaling=1)
-variance=solver.varianceFraction()
+# Convert to pandas DataFrame for better visualization
+correlation_df = pd.DataFrame({'Lag': lags, 'Correlation': correlations, 'p-value': p_values})
 
-for i in range(1):
-    #T_corr=correlation_map(np.roll(X_no3,i),A[:,:,:])
-    #T_reg=np.divide(covariance_map(np.roll(X_no3,i), A[:,:,:]),np.var(np.roll(X_no3,i)))
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-    #ax.set_xticks(np.arange(-180,180,20), crs=ccrs.PlateCarree())
-    lon_formatter = cticker.LongitudeFormatter()
-    #ax.xaxis.set_major_formatter(lon_formatter)
-    # Define the yticks for latitude
-    plt.title("EOF1 Buoyancy")
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-    v = np.linspace(-0.7, 0.7, 40, endpoint=True)
-    fill=ax.contourf(lon,lat,eof1_b[0,:,:].squeeze(),v,cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    ax.set_aspect('auto')
-    cb = plt.colorbar(fill, orientation='vertical',shrink=0.8)
-    font_size = 20 # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, eof1_b[0,:,:]*np.nanstd(pc1_b[:,0],axis=0).squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    polarCentral_set_latlim([-90,-30], ax)
-plt.savefig("eof1_b_final.pdf")
+# Plot the lagged correlation
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 6))
+plt.plot(correlation_df['Lag'], correlation_df['Correlation'], marker='o', label='Correlation')
+plt.axhline(0, color='grey', linestyle='--')
+plt.axhline(y=0.196, color='red', linestyle='--', label='Significance Level (p < 0.05)')
+plt.axhline(y=-0.196, color='red', linestyle='--')
+
+plt.xlabel('Lag')
+plt.ylabel('Correlation')
+plt.grid(True)
+
+# Highlight significant correlations
+significance_level = 0.05
+significant = correlation_df['p-value'] < significance_level
+plt.scatter(correlation_df['Lag'][significant], correlation_df['Correlation'][significant], color='red', label='Significant (p < 0.05)')
+plt.ylabel("Correlation",fontsize=18, fontweight='bold')
+plt.xlabel("Lag",fontsize=18, fontweight='bold')
+plt.xticks(fontsize=18)
+plt.yticks(fontsize=18)
+plt.legend()
+plt.show()
+
+plt.savefig('no3_b_lag.pdf')
 
 
-for i in range(1):
-    plt.figure(figsize=(10, 10),dpi=1200)
-    plt.subplot(211)
 
-    # Create a polar stereographic projection
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
 
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-
-    T_corr=correlation_map(no3_index,A_b[:,:,:])
-    T_reg=np.divide(covariance_map(no3_index, A_b[:,:,:]),np.var(no3_index))
-
-    # Define the yticks for latitude
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-
-    # Contour plot with PlateCarree projection
-    fill = ax.contourf(lon, lat, T_corr.squeeze(), v, cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-
-    # Make the aspect ratio equal to get a circular plot
-    ax.set_aspect('equal')
-
-    # Colorbar
-    cb = plt.colorbar(fill, orientation='vertical', shrink=0.8)
-    font_size = 20  # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    # Set the latitude limits
-    df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
-      dims=["lat","lon'"],
-      coords=[lat, lon])
-    t90=stats.t.ppf(1-0.05, df-2)
-    t95=stats.t.ppf(1-0.025, df-2)
-    sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
-      hatches=['..', None, None, None, '..'], extend='both',
-      add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-
-plt.savefig("correlation_no3_b_GFDL_"+str(i)+".pdf")
 
 pt=pt#(pt*area)/total_area
 pd_detrend=detrend_dim(pt,dim='time')
 pd_clim = pd_detrend.groupby('time.month').mean(dim='time')
 pd_anom = pd_detrend.groupby('time.month') - pd_clim
+
 #zos_anom=zos_anom.coarsen(time=3).mean(
-pd_anom2=wgt_areaave(pd_anom,-90,-30,0,360)
+pd_anom2=wgt_areaave(pd_anom,-90,-50,0,360)
+#pd_anom2=pd_anom2.coarsen(time=2).mean()
 pd_index=pd_anom2/pd_anom2.std()
 
 year=np.arange(1850,2015,1/12)
@@ -2453,12 +2308,44 @@ plt.tight_layout()
 plt.savefig('pd_index.pdf')
 
 
+lags, correlations, p_values = lagged_correlation(no3_index, pd_index, max_lag)
+
+# Convert to pandas DataFrame for better visualization
+correlation_df = pd.DataFrame({'Lag': lags, 'Correlation': correlations, 'p-value': p_values})
+
+# Plot the lagged correlation
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 6))
+plt.plot(correlation_df['Lag'], correlation_df['Correlation'], marker='o', label='Correlation')
+plt.axhline(0, color='grey', linestyle='--')
+plt.axhline(y=0.196, color='red', linestyle='--', label='Significance Level (p < 0.05)')
+plt.axhline(y=-0.196, color='red', linestyle='--')
+
+plt.xlabel('Lag')
+plt.ylabel('Correlation')
+#plt.title('Lagged Correlation between NO3 and MLD')
+plt.grid(True)
+
+# Highlight significant correlations
+significance_level = 0.05
+significant = correlation_df['p-value'] < significance_level
+plt.scatter(correlation_df['Lag'][significant], correlation_df['Correlation'][significant], color='red', label='Significant (p < 0.05)')
+plt.ylabel("Correlation",fontsize=18, fontweight='bold')
+plt.xlabel("Lag",fontsize=18, fontweight='bold')
+plt.xticks(fontsize=18)
+plt.yticks(fontsize=18)
+plt.legend()
+plt.show()
+plt.savefig('no3_pd_lag.pdf')
+
 
 pd_index=np.array(pd_index)
 
 pd_anom3=pd_anom/pd_anom.std()
 
 A_pd=np.array(pd_anom3)
+
 
 infile = '/projects/CDEUTSCH/DATA/GFDL-ESM4-CMIP-fe.nc'
 #data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
@@ -2469,7 +2356,7 @@ fe=data.dfeos
 
 min_lat = -90
 
-max_lat =  -30
+max_lat =  -50
 
 mask_lat = (fe.lat >= min_lat) & (fe.lat <= max_lat)
 
@@ -2479,12 +2366,13 @@ fe = fe.where(mask_lat, drop=True)
 fe_detrend=detrend_dim(fe,dim='time')
 fe_clim = fe_detrend.groupby('time.month').mean(dim='time',skipna=True)
 fe_anom = fe_detrend.groupby('time.month') - fe_clim
+#fe_anom=fe_anom.coarsen(time=2).mean()
 #zos_anom=zos_anom.coarsen(time=3).mean()
 fe_anom2=fe_anom/fe_anom.std()
 
 A_fe=np.array(fe_anom2)
 
-fe_anom=wgt_areaave(fe_anom,-90,-30,0,360)
+fe_anom=wgt_areaave(fe_anom,-90,-50,0,360)
 fe_index=fe_anom/fe_anom.std()
 
 year=np.arange(1850,2015,1/12)
@@ -2498,85 +2386,38 @@ plt.tight_layout()
 plt.savefig('fe_index.pdf')
 
 
-
 fe_index=np.array(fe_index)
-print('fe',fe_index)
-print('tos',tos_index)
-print('zos',zos_index)
-from sklearn.linear_model import LinearRegression
-from sklearn.linear_model import LogisticRegression
-from sklearn.linear_model import Ridge
+max_lag = 60  # Define the maximum lag you want to consider
+lags, correlations, p_values = lagged_correlation(no3_index, fe_index, max_lag)
 
-fig, axarr = plt.subplots(nrows=2, figsize=[2,10])
-for i in range(1):
-    #T_corr=correlation_map(np.roll(-pc1_mld[:,0]/np.nanstd(pc1_mld[:,0],axis=0),i),A_no3[:,:,:])
-    #T_reg=np.divide(covariance_map(np.roll(-pc1_mld[:,0]/np.nanstd(pc1_mld[:,0],axis=0),i), A_no3[:,:,:]),np.var(np.roll(-pc1_mld[:,0]/np.nanstd(pc1_mld[:,0],axis=0),i)))
-    plt.figure(figsize=(10, 10),dpi=1200)
-    T_corr=correlation_map(fe_index,A_tos[:,:,:])
-    T_reg=np.divide(covariance_map(fe_index, A_tos[:,:,:]),np.var(fe_index))
+# Convert to pandas DataFrame for better visualization
+correlation_df = pd.DataFrame({'Lag': lags, 'Correlation': correlations, 'p-value': p_values})
 
-    plt.figure(figsize=(13,6.2))
-    plt.subplot(211)
-    ax=fig.add_axes([0.1,0.1,0.8,0.8])
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-    #ax.set_xticks(np.arange(-180,180,20), crs=ccrs.PlateCarree())
-    lon_formatter = cticker.LongitudeFormatter()
-    #ax.xaxis.set_major_formatter(lon_formatter)
-    # Define the yticks for latitude
-    #plt.title("correlation map  NO3 and MLD")
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-    fill=ax.contourf(lon,lat,T_corr.squeeze(),v,cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    ax.set_aspect('auto')
-    cb = plt.colorbar(fill, orientation='vertical',shrink=1.1)
-    font_size = 20 # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    df = 40
-    sig=xr.DataArray(data=T_corr*np.sqrt((df-2)/(1-np.square(T_corr))),
-      dims=["lat","lon'"],
-      coords=[lat, lon])
-    t90=stats.t.ppf(1-0.05, df-2)
-    t95=stats.t.ppf(1-0.025, df-2)
-    sig.plot.contourf(ax=ax,levels = [-1*t95, -1*t90, t90, t95], colors='none',
-      hatches=['..', None, None, None, '..'], extend='both',
-      add_colorbar=False, transform=ccrs.PlateCarree())
-    ax.set_extent([-180, 180, -90, -30], crs=ccrs.PlateCarree())
-plt.savefig("correlation_fe_tos_GFDL_"+str(i)+".pdf")
+# Plot the lagged correlation
+import matplotlib.pyplot as plt
 
-fig, axarr = plt.subplots(nrows=2, figsize=[2,10])
-for i in range(1):
-    #T_corr=correlation_map(np.roll(-pc1_mld[:,0]/np.nanstd(pc1_mld[:,0],axis=0),i),A_no3[:,:,:])
-    #T_reg=np.divide(covariance_map(np.roll(-pc1_mld[:,0]/np.nanstd(pc1_mld[:,0],axis=0),i), A_no3[:,:,:]),np.var(np.roll(-pc1_mld[:,0]/np.nanstd(pc1_mld[:,0],axis=0),i)))
-    plt.figure(figsize=(10, 10),dpi=1200)
-    T_corr=correlation_map(fe_index,A_zos[:,:,:])
-    T_reg=np.divide(covariance_map(fe_index, A_zos[:,:,:]),np.var(fe_index))
+plt.figure(figsize=(10, 6))
+plt.plot(correlation_df['Lag'], correlation_df['Correlation'], marker='o', label='Correlation')
+plt.axhline(0, color='grey', linestyle='--')
+plt.axhline(y=0.196, color='red', linestyle='--', label='Significance Level (p < 0.05)')
+plt.axhline(y=-0.196, color='red', linestyle='--')
 
-    plt.figure(figsize=(13,6.2))
-    plt.subplot(211)
-    ax=fig.add_axes([0.1,0.1,0.8,0.8])
-    ax = plt.subplot(1, 1, 1, projection=ccrs.SouthPolarStereo())
-    ax.coastlines(resolution='110m')
-    ax.gridlines()
-    #ax.set_xticks(np.arange(-180,180,20), crs=ccrs.PlateCarree())
-    lon_formatter = cticker.LongitudeFormatter()
-    #ax.xaxis.set_major_formatter(lon_formatter)
-    # Define the yticks for latitude
-    #plt.title("correlation map  NO3 and MLD")
-    lat_formatter = cticker.LatitudeFormatter()
-    ax.yaxis.set_major_formatter(lat_formatter)
-    v = np.linspace(-0.5, 0.5, 40, endpoint=True)
-    fill=ax.contourf(lon,lat,T_corr.squeeze(),v,cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    ax.set_aspect('auto')
-    cb = plt.colorbar(fill, orientation='vertical',shrink=1.1)
-    font_size = 20 # Adjust as appropriate.
-    cb.ax.tick_params(labelsize=font_size)
-    ax.contour(lon,lat, T_reg.squeeze(),color='k',cmap=plt.cm.RdBu_r, transform=ccrs.PlateCarree())
-    polarCentral_set_latlim([-90,-30], ax)
-plt.savefig("correlation_fe_zos_GFDL_"+str(i)+".pdf")
+plt.xlabel('Lag')
+plt.ylabel('Correlation')
+plt.title('Lagged Correlation between NO3 and MLD')
+plt.grid(True)
+
+# Highlight significant correlations
+significance_level = 0.05
+significant = correlation_df['p-value'] < significance_level
+plt.scatter(correlation_df['Lag'][significant], correlation_df['Correlation'][significant], color='red', label='Significant (p < 0.05)')
+plt.ylabel("Correlation",fontsize=13, fontweight='bold')
+plt.xlabel("Lag",fontsize=13, fontweight='bold')
+plt.xticks(fontsize=13)
+plt.yticks(fontsize=13)
+plt.legend()
+plt.show()
+plt.savefig('no3_fe_lag.pdf')
 
 
 
@@ -2608,62 +2449,42 @@ def ts_int(ts_diff, ts_base, start=0):
         ts_integrated[1:] = np.cumsum(ts_diff[1:]) + ts_base[:-1]
         return ts_integrated.tolist()
 
-
-def ts_int(ts_diff, ts_base, start=0):
-        ts_diff = np.asarray(ts_diff)  # Convert to NumPy array for vectorized operations
-        ts_base = np.asarray(ts_base)
-
-        ts = np.empty_like(ts_diff)  # Create an empty array to store the integrated time series
-        ts[0] = start + ts_diff[0]  # Set the initial value
-
-        # Perform vectorized addition to calculate the integrated series
-        ts[1:] = ts_diff[1:] + ts_base[:-1]
-
-        return ts.tolist()
-
 #def ts_int(ts_diff, ts_base, start=0):
-    #    """
-    #    Integrate a differenced time series using cumulative sum.
-
-    #    Parameters:
-    #    - ts_diff (numpy array): The differenced time series.
-    #    - ts_base (numpy array): The base time series.
-    #    - start (float): The initial value for integration.
-
-    #    Returns:
-    #    - ts_integrated (numpy array): The integrated time series.
-    #    """
-#        ts_diff = np.asarray(ts_diff)
+#        ts_diff = np.asarray(ts_diff)  # Convert to NumPy array for vectorized operations
 #        ts_base = np.asarray(ts_base)
 
-#        ts_integrated = np.empty_like(ts_diff)
-#        ts_integrated[0] = start + ts_diff[0]
+#        ts = np.empty_like(ts_diff)  # Create an empty array to store the integrated time series
+#        ts[0] = start + ts_diff[0]  # Set the initial value
 
-        # Use cumulative sum for integration
-#        ts_integrated[1:] = np.cumsum(ts_diff[1:]) + ts_base[:-1]
-#        return ts_integrated.tolist()
+        # Perform vectorized addition to calculate the integrated series
+#        ts[1:] = ts_diff[1:] + ts_base[:-1]
+
+#        return ts.tolist()
+
+#        ts_diff = np.asarray(ts_diff)  # Convert to NumPy array for vectorized operations
+#        ts_base = np.asarray(ts_base)
+
+#        ts = np.empty_like(ts_diff)  # Create an empty array to store the integrated time series
+#        ts[0] = start + ts_diff[0]  # Set the initial value
+
+        # Perform vectorized addition to calculate the integrated series
+#        ts[1:] = ts_diff[1:] + ts_base[:-1]
+
+#        return ts.tolist()
 
 
-npp_index=npp_index.T
-print('ekman_pumping_index',ekman_pumping_index.shape)
-print('zos_index',zos_index.shape)
-print('tos_index',tos_index.shape)
-print('so_index',so_index.shape)
-print('mld_index',mld_index.shape)
-print('pd_index',pd_index.shape)
-print('fe_index',fe_index.shape)
 
 
-from sklearn import datasets, linear_model
-
-D=np.concatenate((tos_index,so_index,zos_index,ekman_pumping_index,mld_index,b_index,pd_index,fe_index),axis=0)
-D=D.reshape(1980,8)
-
+D=np.concatenate((tos_index,so_index,ekman_pumping_index,mld_index,b_index,pd_index),axis=0)
+D=D.reshape(1980,6)
 
 for j in range(D.shape[1]):
       D[:,j]=ts_diff(D[:,j])
 # Use the mask to exclude NaN values
+T=np.array(no3_index)
 
+T1=np.zeros((1980,))
+T1[:,]=ts_diff(T)
 print('D',D.shape)
 #if k>0:
 #   D=np.concatenate((pc1_chl[:,:5],pc1_tos[:,:5],pc1_so[:,:3],pc1_zos[:,:5]),axis=1) # full case
@@ -2672,32 +2493,33 @@ print('D',D.shape)
 
 #if i>0:
 #   #D=np.concatenate((X_no3[:-Z[i],np.newaxis],X_po4[:-Z[i],np.newaxis],pc1_tos[:-Z[i],:10],pc1_so[:-Z[i],:5],pc1_zos[:-Z[i],:5]),axis=1)
-T2=np.array(no3_index)
-X_ss, Y_mm =  split_sequences(D,T2,96,96)
+
+X_ss, Y_mm =  split_sequences(D,T1,108,108)
 print("X_ss",X_ss.shape)
 print("y_mm",Y_mm.shape)
 train_ratio=0.7
-train_len = round(len(X_ss[:-(96+96+264)]) * train_ratio)
+train_len = round(len(X_ss[:-(108+108+264)]) * train_ratio)
 test_len=126 #150/3
 
 
 threshold = 0.5  # Adjust this threshold as needed for binary classification
 #X_train, y_train = create_binary_sequences(train_data, input_length, output_length)
 #X_test, y_test = create_binary_sequences(test_data, input_length, output_length)
-X_train,y_train=X_ss[:-(96+96+264)],Y_mm[:-(96+96+264)]
+X_train,y_train=X_ss[:-(108+108+264)],Y_mm[:-(108+108+264)]
 X_train = X_train.reshape(X_train.shape[0], -1)
 
-X_test,y_test=X_ss[-(96+96+264):],Y_mm[-(96+96+264):]
+X_test,y_test=X_ss[-(108+108+264):],Y_mm[-(108+108+264):]
 X_test = X_test.reshape(X_test.shape[0], -1)
 
 # Create and fit a logistic regression model
-alpha = 0.05  # Regularization strength (adjust as needed)
+alpha = 0.5  # Regularization strength (adjust as needed)
 model = Ridge(alpha=alpha)
 model.fit(X_train, y_train)
 # Make predictions on the test data
 y_pred = model.predict(X_test)
 
-
+skill_reg=np.zeros((18))
+test_len=108+108+264
 prediction1=np.zeros((264))
 prediction2=np.zeros((264))
 prediction3=np.zeros((264))
@@ -2707,19 +2529,28 @@ prediction6=np.zeros((264))
 prediction7=np.zeros((264))
 prediction8=np.zeros((264))
 prediction9=np.zeros((264))
+prediction10=np.zeros((264))
+prediction11=np.zeros((264))
+prediction12=np.zeros((264))
+prediction13=np.zeros((264))
+prediction14=np.zeros((264))
+prediction15=np.zeros((264))
+prediction16=np.zeros((264))
+prediction17=np.zeros((264))
 
-skill_reg=np.zeros((9))
+
 for N in range(264):
   if N==0:
 
-     X_test, Y_test= X_ss[-96:],Y_mm[-96:]
+     X_test, Y_test= X_ss[-108:],Y_mm[-108:]
      X_test = X_test.reshape(X_test.shape[0], -1)
      y_pred = model.predict(X_test)
      Z=ts_int(
-           y_pred[-1,:].tolist(),
-           T2[-96:,],
-           start = T2[-96,]
+             y_pred[-1,:].tolist(),
+           no3_index[-108:,],
+           start = no3_index[-108-1,]
            )
+     
      prediction1[N]=Z[-1]
      prediction2[N]=Z[-12]
      prediction3[N]=Z[-24]
@@ -2727,18 +2558,18 @@ for N in range(264):
      prediction5[N]=Z[-48]
      prediction6[N]=Z[-60]
      prediction7[N]=Z[-72]
-     prediction8[N]=Z[-84]
-     
+     prediction8[N]=Z[-84] 
+     prediction9[N]=Z[-96]
 
   if N>0:
 
-     X_test, Y_test= X_ss[-96-N:-N],Y_mm[-96-N:-N]
+     X_test, Y_test= X_ss[-108-N:-N],Y_mm[-108-N:-N]
      X_test = X_test.reshape(X_test.shape[0], -1)
      y_pred = model.predict(X_test)
      Z=ts_int(
-           y_pred[-1,:].tolist(),
-           T2[-96-N:-N,],
-           start = T2[-96-N,]
+             y_pred[-1,:].tolist(),
+           no3_index[-108-N:-N,],
+           start = no3_index[-108-N-1,]
            )
      prediction1[N]=Z[-1]
      prediction2[N]=Z[-12]
@@ -2747,25 +2578,27 @@ for N in range(264):
      prediction5[N]=Z[-48]
      prediction6[N]=Z[-60]
      prediction7[N]=Z[-72]
-     prediction8[N]=Z[-84]
-
+     prediction8[N]=Z[-84] 
+     prediction9[N]=Z[-96]
 
 Q=12
-A=np.corrcoef(prediction1[::-1],T2[-264:,])
+A=np.corrcoef(prediction1[::-1],no3_index[-264:,])
+skill_reg[9]=A[1][0]
+A=np.corrcoef(prediction2[::-1],no3_index[-264-Q:-12,])
 skill_reg[8]=A[1][0]
-A=np.corrcoef(prediction2[::-1],T2[-264-Q:-12,])
+A=np.corrcoef(prediction3[::-1],no3_index[-264-Q*2:-24,])
 skill_reg[7]=A[1][0]
-A=np.corrcoef(prediction3[::-1],T2[-264-Q*2:-24,])
+A=np.corrcoef(prediction4[::-1],no3_index[-264-Q*3:-36,])
 skill_reg[6]=A[1][0]
-A=np.corrcoef(prediction4[::-1],T2[-264-Q*3:-36,])
+A=np.corrcoef(prediction5[::-1],no3_index[-264-Q*4:-48,])
 skill_reg[5]=A[1][0]
-A=np.corrcoef(prediction5[::-1],T2[-264-Q*4:-48,])
+A=np.corrcoef(prediction6[::-1],no3_index[-264-Q*5:-60,])
 skill_reg[4]=A[1][0]
-A=np.corrcoef(prediction6[::-1],T2[-264-Q*5:-60,])
+A=np.corrcoef(prediction7[::-1],no3_index[-264-Q*6:-72,])
 skill_reg[3]=A[1][0]
-A=np.corrcoef(prediction7[::-1],T2[-264-Q*6:-72,])
+A=np.corrcoef(prediction8[::-1],no3_index[-264-Q*7:-84,])
 skill_reg[2]=A[1][0]
-A=np.corrcoef(prediction8[::-1],T2[-264-Q*7:-84,])
+A=np.corrcoef(prediction9[::-1],no3_index[-264-Q*8:-96,])
 skill_reg[1]=A[1][0]
 skill_reg[0]=1
 
@@ -2778,6 +2611,7 @@ plt.yticks(fontsize=13)
 
 plt.savefig('skill_NO3_reg.pdf')
 
+
 from sklearn.linear_model import LinearRegression
 
 model =LinearRegression()#LinearRegression()
@@ -2786,10 +2620,10 @@ alpha = 0.5  # Regularization strength (adjus
 threshold = 0.5  # Adjust this threshold as needed for binary classification
 #X_train, y_train = create_binary_sequences(train_data, input_length, output_length)
 #X_test, y_test = create_binary_sequences(test_data, input_length, output_length)
-X_train,y_train=X_ss[:-(96+96+264)],Y_mm[:-(96+96+264)]
+X_train,y_train=X_ss[:-(108+108+264)],Y_mm[:-(108+108+264)]
 X_train = X_train.reshape(X_train.shape[0], -1)
 
-X_test,y_test=X_ss[-(96+96+264):],Y_mm[-(96+96+264):]
+X_test,y_test=X_ss[-(108+108+264):],Y_mm[-(108+108+264):]
 X_test = X_test.reshape(X_test.shape[0], -1)
 
 model.fit(X_train, y_train)
@@ -2806,18 +2640,28 @@ prediction6=np.zeros((264))
 prediction7=np.zeros((264))
 prediction8=np.zeros((264))
 prediction9=np.zeros((264))
+prediction10=np.zeros((264))
+prediction11=np.zeros((264))
+prediction12=np.zeros((264))
+prediction13=np.zeros((264))
+prediction14=np.zeros((264))
+prediction15=np.zeros((264))
+prediction16=np.zeros((264))
+prediction17=np.zeros((264))
+prediction18=np.zeros((264))
 
-skill_linreg=np.zeros((9))
+
+skill_linreg=np.zeros((18))
 for N in range(264):
   if N==0:
 
-     X_test, Y_test= X_ss[-96:],Y_mm[-96:]
+     X_test, Y_test= X_ss[-108:],Y_mm[-108:]
      X_test = X_test.reshape(X_test.shape[0], -1)
      y_pred = model.predict(X_test)
      Z=ts_int(
-           y_pred[-1,:].tolist(),
-           T2[-96:,],
-           start = T2[-96,]
+             y_pred[-1,:].tolist(),
+           no3_index[-108:,],
+           start = no3_index[-108-1,]
            )
      prediction1[N]=Z[-1]
      prediction2[N]=Z[-12]
@@ -2827,15 +2671,17 @@ for N in range(264):
      prediction6[N]=Z[-60]
      prediction7[N]=Z[-72]
      prediction8[N]=Z[-84]
+     prediction9[N]=Z[-96]
+
   if N>0:
 
-     X_test, Y_test= X_ss[-96-N:-N],Y_mm[-96-N:-N]
+     X_test, Y_test= X_ss[-108-N:-N],Y_mm[-108-N:-N]
      X_test = X_test.reshape(X_test.shape[0], -1)
      y_pred = model.predict(X_test)
      Z=ts_int(
-           y_pred[-1,:].tolist(),
-           T2[-96-N:-N,],
-           start = T2[-96-N,]
+             y_pred[-1,:].tolist(),
+           no3_index[-108-N:-N,],
+           start = no3_index[-108-N-1,]
            )
      prediction1[N]=Z[-1]
      prediction2[N]=Z[-12]
@@ -2845,24 +2691,25 @@ for N in range(264):
      prediction6[N]=Z[-60]
      prediction7[N]=Z[-72]
      prediction8[N]=Z[-84]
-
-
+     prediction9[N]=Z[-96]
 Q=12
-A=np.corrcoef(prediction1[::-1],T2[-264:,])
+A=np.corrcoef(prediction1[::-1],no3_index[-264:,])
+skill_linreg[9]=A[1][0]
+A=np.corrcoef(prediction2[::-1],no3_index[-264-Q:-12,])
 skill_linreg[8]=A[1][0]
-A=np.corrcoef(prediction2[::-1],T2[-264-Q:-12,])
+A=np.corrcoef(prediction3[::-1],no3_index[-264-Q*2:-24,])
 skill_linreg[7]=A[1][0]
-A=np.corrcoef(prediction3[::-1],T2[-264-Q*2:-24,])
+A=np.corrcoef(prediction4[::-1],no3_index[-264-Q*3:-36,])
 skill_linreg[6]=A[1][0]
-A=np.corrcoef(prediction4[::-1],T2[-264-Q*3:-36,])
+A=np.corrcoef(prediction5[::-1],no3_index[-264-Q*4:-48,])
 skill_linreg[5]=A[1][0]
-A=np.corrcoef(prediction5[::-1],T2[-264-Q*4:-48,])
+A=np.corrcoef(prediction6[::-1],no3_index[-264-Q*5:-60,])
 skill_linreg[4]=A[1][0]
-A=np.corrcoef(prediction6[::-1],T2[-264-Q*5:-60,])
+A=np.corrcoef(prediction7[::-1],no3_index[-264-Q*6:-72,])
 skill_linreg[3]=A[1][0]
-A=np.corrcoef(prediction7[::-1],T2[-264-Q*6:-72,])
+A=np.corrcoef(prediction8[::-1],no3_index[-264-Q*7:-84,])
 skill_linreg[2]=A[1][0]
-A=np.corrcoef(prediction8[::-1],T2[-264-Q*7:-84,])
+A=np.corrcoef(prediction9[::-1],no3_index[-264-Q*8:-96,])
 skill_linreg[1]=A[1][0]
 skill_linreg[0]=1
 
@@ -2874,35 +2721,3 @@ plt.xticks(fontsize=13)
 plt.yticks(fontsize=13)
 
 plt.savefig('skill_NO3_linearregression.png')
-
-print("y_pred",y_pred.shape)
-# Convert y_pred_test to a NumPy array
-
-#corr, _ = scipy.stats.pearsonr(predictions, Y_test)
-#rmse = mean_squared_error(Y_test, predictions)
-
-#print("predictions",predictions.shape)
-#print("Y_test",Y_test.shape)
-print("end first file")
-
-
-## PO4
-#infile = '/scratch/gpfs/gn5970/po4-GFDL-ESM4.nc'
-#data = xr.open_mfdataset(infile, drop_variables=['time_bnds'])
-#data=xr.open_dataset(infile)
-#data['time']=pd.date_range("1850-01-01", periods=1980, freq="M")
-#min_lat = -90
-
-#po4=(data.po4*area)/ total_area
-#po4_detrend=detrend_dim(po4,dim='time')
-#po4_clim = po4_detrend.groupby('time.month').mean(dim='time')
-#po4_anom = po4_detrend.groupby('time.month') - po4_clim
-#A_po4=np.array(po4_anom)
-
-#po4_anom=wgt_areaave(po4_anom,-90,-30,0,360)
-#po4_index=po4_anom/po4_anom.std()
-#po4_index=np.array(po4_index)
-
-#plt.figure()
-#plt.plot(po4_index)
-#plt.savefig("po4_index.pdf")
